@@ -4,6 +4,21 @@ Sistema de archivos distribuido **por bloques**, con alta disponibilidad, rendim
 
 Un archivo nunca se guarda completo en una sola máquina ni se carga completo en memoria: el cliente lo parte en bloques, cada bloque se guarda en varios DataNodes, y al descargarlo se reconstruye verificando la firma SHA-256 de cada bloque.
 
+**Autores:** Andrés Vélez Rendón, Jose Luis Restrepo.
+
+## Entregas
+
+Cada entrega tiene su carpeta en `docs/` y su informe en PDF, todos con el mismo formato.
+
+| Hito | Contenido | Informe | Estado |
+|---|---|---|---|
+| 1 | Especificación del proyecto | [`docs/hito-1/hito-1-especificacion.pdf`](docs/hito-1/hito-1-especificacion.pdf) | Entregado |
+| 2 | Arquitectura distribuida y comunicaciones | [`docs/hito-2/hito-2-arquitectura-y-comunicaciones.pdf`](docs/hito-2/hito-2-arquitectura-y-comunicaciones.pdf) | Entregado, etiqueta `hito-2` |
+| 3 | Alta disponibilidad, replicación, consistencia y seguridad | — | Pendiente |
+| 4 | Entrega final | — | Pendiente |
+
+Los informes desde el Hito 2 se escriben en LaTeX con la plantilla común [`docs/plantilla/dfsha-informe.sty`](docs/plantilla/dfsha-informe.sty) y se compilan con `./scripts/build-informes.sh` (requiere TeX Live con LuaLaTeX).
+
 ## Arquitectura
 
 Cliente/Servidor con el servicio distribuido (Opción 1), patrón Maestro–Trabajador:
@@ -29,7 +44,9 @@ Cliente/Servidor con el servicio distribuido (Opción 1), patrón Maestro–Trab
 
 - **ControlNode** (Go): metadatos, DataNodes vivos, planes de lectura y escritura. Nunca recibe datos de archivos.
 - **DataNode** (Go): guarda bloques en disco y propaga copias a otros DataNodes.
-- **Cliente** (Python): CLI que parte, sube, baja y reconstruye archivos. No tiene direcciones de DataNodes configuradas: las recibe en cada plan.
+- **Cliente** (Python, sin dependencias): parte, sube, baja y reconstruye archivos. No tiene direcciones de DataNodes configuradas: las recibe en cada plan.
+
+El detalle de la arquitectura, los algoritmos, la API y las pruebas está en el [informe del Hito 2](docs/hito-2/hito-2-arquitectura-y-comunicaciones.pdf).
 
 ## Estructura del repositorio
 
@@ -38,13 +55,17 @@ Cliente/Servidor con el servicio distribuido (Opción 1), patrón Maestro–Trab
 ├── cmd/
 │   ├── controlnode/     ControlNode: configuración, planificador y endpoints HTTP
 │   └── datanode/        DataNode: almacenamiento de bloques y comunicación con otros nodos
-├── client/
-│   ├── dfsha.py         Cliente CLI
-│   └── test_dfsha.py    Pruebas del cliente
+├── client/              Cliente CLI y sus pruebas
 ├── docker/              Un Dockerfile por componente
-├── docs/                Documentos de cada hito
-├── scripts/demo.sh      Demostración de punta a punta
-├── docker-compose.yml   Clúster local: 1 ControlNode + 3 DataNodes
+├── deploy/aws/          Despliegue en varias VMs (AWS Academy)
+├── docs/
+│   ├── hito-1/          Informe del Hito 1
+│   ├── hito-2/          Informe del Hito 2 (PDF y fuente LaTeX)
+│   └── plantilla/       Formato común de los informes
+├── scripts/
+│   ├── demo.sh          Demostración de punta a punta
+│   └── build-informes.sh
+├── docker-compose.yml   Clúster local: 1 ControlNode + 3 DataNodes (+1 opcional)
 └── go.mod
 ```
 
@@ -58,9 +79,15 @@ La forma más rápida de verlo funcionar es la demostración completa:
 ./scripts/demo.sh
 ```
 
-Levanta el clúster, sube un archivo de 40 MB, lo descarga, prueba la reserva de escritura, apaga un DataNode, vuelve a descargar desde las réplicas y compara las firmas SHA-256.
+Levanta el clúster y ejecuta, en orden:
 
-### Paso a paso
+1. Sube un archivo de 40 MB y lo descarga.
+2. Prueba la reserva de escritura.
+3. Apaga un DataNode y vuelve a descargar desde las réplicas.
+4. Agrega un cuarto DataNode en caliente.
+5. Compara las firmas SHA-256.
+
+### Paso a paso con Docker
 
 ```bash
 docker compose up -d --build controlnode dn1 dn2 dn3
@@ -80,18 +107,39 @@ dfsha get /demo/archivo.bin /host/archivo-descargado.bin
 sha256sum archivo.bin archivo-descargado.bin
 ```
 
-Para probar la tolerancia a fallos:
+Tolerancia a fallos y escalado:
 
 ```bash
 docker compose stop dn1
-sleep 10                                 # el ControlNode lo da por muerto a los 9 s
+sleep 10                                  # el ControlNode lo da por muerto a los 9 s
 dfsha get /demo/archivo.bin /host/sin-dn1.bin
 docker compose start dn1
+
+docker compose --profile scale up -d dn4  # agrega un DataNode sin reiniciar nada
 ```
 
-Para apagar todo y borrar los datos: `docker compose down -v`.
+Para apagar todo y borrar los datos: `docker compose --profile scale down -v`.
 
-### Comandos del cliente
+### Sin Docker
+
+Requiere Go 1.23 o superior y Python 3.
+
+```bash
+go build -o controlnode ./cmd/controlnode && ./controlnode &
+go build -o datanode ./cmd/datanode
+NODE_ID=dn-01 PORT=8001 STORAGE_DIR=./dn1 ./datanode &
+NODE_ID=dn-02 PORT=8002 STORAGE_DIR=./dn2 ./datanode &
+NODE_ID=dn-03 PORT=8003 STORAGE_DIR=./dn3 ./datanode &
+
+python3 client/dfsha.py login demo demo
+python3 client/dfsha.py put archivo.bin /archivo.bin
+```
+
+### En varias máquinas (AWS Academy)
+
+Ver [`deploy/aws/README.md`](deploy/aws/README.md): un mismo `docker-compose.yml` para todas las VMs y un `.env` por VM.
+
+## Cliente
 
 | Comando | Qué hace |
 |---|---|
@@ -103,6 +151,8 @@ Para apagar todo y borrar los datos: `docker compose down -v`.
 | `stat <ruta>` | Tamaño, bloques, copias vivas y dueño |
 | `put <local> <remoto> [--workers N]` | Sube un archivo partido en bloques |
 | `get <remoto> <local> [--workers N]` | Descarga y reconstruye un archivo |
+
+La dirección del ControlNode se indica con `--control` o con la variable `DFSHA_CONTROL` (por defecto `http://localhost:8000`).
 
 ### Credenciales de demostración
 
@@ -132,31 +182,9 @@ REPLICATION_FACTOR=1 BLOCK_SIZE_MIN_MB=4 docker compose up -d
 | `HEARTBEAT_MISSES` | 3 | Heartbeats perdidos para dar por muerto un DataNode |
 | `WRITE_LEASE_TTL_SECONDS` | 60 | Vigencia de la reserva de escritura de un archivo |
 
-El detalle de cada parámetro y de dónde sale su valor está en la [documentación del Hito 2](docs/hito-2-arquitectura-y-comunicaciones.md#7-parámetros).
-
 ## Pruebas
 
 ```bash
 go test ./...
 python3 -m unittest discover client
 ```
-
-## Documentación
-
-| Documento | Contenido |
-|---|---|
-| [Hito 1 — Especificación](docs/hito-1-especificacion.pdf) | Definición del servicio, arquitectura, algoritmos de particionamiento y replicación, protocolos, infraestructura |
-| [Hito 2 — Arquitectura y comunicaciones](docs/hito-2-arquitectura-y-comunicaciones.md) | Implementación, contratos de API, cambios respecto al Hito 1, pendientes y resultados de pruebas |
-
-## Estado por hito
-
-| Hito | Contenido | Estado |
-|---|---|---|
-| 1 | Especificación del proyecto | Entregado |
-| 2 | Arquitectura distribuida y comunicaciones | Implementado |
-| 3 | Alta disponibilidad, replicación, consistencia y seguridad | Pendiente |
-| 4 | Entrega final | Pendiente |
-
-**Implementado en el Hito 2:** particionamiento con la fórmula del Hito 1, ubicación por menor ocupación, 2 copias por bloque en nodos distintos con tope N − 1, propagación DataNode → DataNode, integridad SHA-256, subidas y descargas en paralelo sin cargar el archivo en memoria, reserva de un solo escritor por archivo (`409`), reintentos con espera creciente en la subida de bloques, lectura desde otra réplica si una falla, y parámetros configurables.
-
-**Pendiente para el Hito 3:** tres ControlNodes con elección de líder, persistencia de metadatos, auto-reparación de copias tras la caída de un nodo (el campo `orders` del heartbeat sigue vacío), rebalanceo y `node_full_threshold`, recolección de bloques huérfanos, HTTPS, cifrado en disco y control de acceso real por usuario. La lista completa, con su justificación, está en la [sección 10 del documento del Hito 2](docs/hito-2-arquitectura-y-comunicaciones.md#10-pendiente-para-el-hito-3).
