@@ -1,30 +1,18 @@
-# DFSha — Hito 2 (Semanas 2–3)
+# DFSha — Sistema de archivos distribuido
 
-Implementación base del **DFS por bloques** definido en el Hito 1. Este entregable se concentra en lo pedido para las semanas 2–3: **arquitectura distribuida de la Opción 1 (Cliente/Servidor con servicio distribuido)** y **especificación/implementación de comunicaciones**.
+Sistema de archivos distribuido **por bloques**, con alta disponibilidad, rendimiento y seguridad. Proyecto 1 de ST0263 Tópicos Especiales en Telemática / SI3007 Sistemas Distribuidos, Universidad EAFIT, 2026-2.
 
-## Qué está implementado
+Un archivo nunca se guarda completo en una sola máquina ni se carga completo en memoria: el cliente lo parte en bloques, cada bloque se guarda en varios DataNodes, y al descargarlo se reconstruye verificando la firma SHA-256 de cada bloque.
 
-- `ControlNode` en Go: registro y seguimiento de DataNodes, metadatos en memoria, namespace básico, plan de subida, commit y plan de descarga.
-- `DataNode` en Go: almacenamiento de bloques en disco, `PUT/GET/DELETE`, `Range` mediante `http.ServeContent`, heartbeat y propagación DataNode → DataNode.
-- Cliente CLI en Python: `login`, `ls`, `mkdir`, `rmdir`, `rm`, `mv`, `stat`, `put`, `get`.
-- Particionamiento por bloques de 8–64 MiB y plan calculado por el ControlNode.
-- Distribución por menor ocupación con carga virtual durante la planificación.
-- Factor de replicación 2 cuando existen al menos dos DataNodes.
-- Subidas y descargas concurrentes desde el cliente (`--workers`, 4 por defecto).
-- Integridad de bloque con SHA-256, que además funciona como `block_id`.
-- Docker Compose con 1 ControlNode activo y 3 DataNodes.
+## Arquitectura
 
-## Qué se deja deliberadamente para Hito 3
-
-El Hito 1 define el diseño final con tres ControlNodes, replicación de metadatos, elección de líder, persistencia fuerte, cifrado en reposo y HTTPS. Esas funciones pertenecen al hito de **Alta Disponibilidad, Replicación, Consistencia y Seguridad**. Por eso en Hito 2 quedan definidos los endpoints `/cluster/replicate` y `/cluster/election`, pero responden `501 Not Implemented` para no presentar como terminado algo que corresponde a semanas 4–5.
-
-## Arquitectura ejecutable de Hito 2
+Cliente/Servidor con el servicio distribuido (Opción 1), patrón Maestro–Trabajador:
 
 ```text
                         control / metadatos
 +----------------+   REST/JSON   +------------------+
-| Cliente Python | ------------> | ControlNode cn-01|
-| CLI            | <------------ | :8000            |
+| Cliente CLI    | ------------> | ControlNode      |
+| (Python)       | <------------ | :8000            |
 +-------+--------+               +---------+--------+
         |                                   ^
         | bloques binarios                  | register / heartbeat
@@ -39,129 +27,136 @@ El Hito 1 define el diseño final con tres ControlNodes, replicación de metadat
                      réplica entre DataNodes
 ```
 
-El cliente nunca necesita conocer de antemano las direcciones de los DataNodes: pide un plan al ControlNode en cada operación.
+- **ControlNode** (Go): metadatos, DataNodes vivos, planes de lectura y escritura. Nunca recibe datos de archivos.
+- **DataNode** (Go): guarda bloques en disco y propaga copias a otros DataNodes.
+- **Cliente** (Python): CLI que parte, sube, baja y reconstruye archivos. No tiene direcciones de DataNodes configuradas: las recibe en cada plan.
 
-## Inicio rápido con Docker
+## Estructura del repositorio
+
+```text
+.
+├── cmd/
+│   ├── controlnode/     ControlNode: configuración, planificador y endpoints HTTP
+│   └── datanode/        DataNode: almacenamiento de bloques y comunicación con otros nodos
+├── client/
+│   ├── dfsha.py         Cliente CLI
+│   └── test_dfsha.py    Pruebas del cliente
+├── docker/              Un Dockerfile por componente
+├── docs/                Documentos de cada hito
+├── scripts/demo.sh      Demostración de punta a punta
+├── docker-compose.yml   Clúster local: 1 ControlNode + 3 DataNodes
+└── go.mod
+```
+
+## Inicio rápido
+
+Requiere Docker con Docker Compose. Todo se ejecuta desde la raíz del repositorio.
+
+La forma más rápida de verlo funcionar es la demostración completa:
+
+```bash
+./scripts/demo.sh
+```
+
+Levanta el clúster, sube un archivo de 40 MB, lo descarga, prueba la reserva de escritura, apaga un DataNode, vuelve a descargar desde las réplicas y compara las firmas SHA-256.
+
+### Paso a paso
 
 ```bash
 docker compose up -d --build controlnode dn1 dn2 dn3
+curl http://localhost:8000/health        # debe reportar alive_datanodes: 3
 ```
 
-Comprobar estado:
+El cliente corre como contenedor dentro de la red del clúster. Para no repetir las opciones, conviene un alias:
 
 ```bash
-curl http://localhost:8000/health
+alias dfsha='docker compose --profile tools run --rm -e DFSHA_TOKEN=dfsha-dev-token -v "$PWD:/host" client'
+
+dfsha mkdir /demo
+dfsha put /host/archivo.bin /demo/archivo.bin
+dfsha ls /demo
+dfsha stat /demo/archivo.bin
+dfsha get /demo/archivo.bin /host/archivo-descargado.bin
+sha256sum archivo.bin archivo-descargado.bin
 ```
 
-Crear un archivo de prueba y subirlo usando el cliente dentro de la red Docker:
+Para probar la tolerancia a fallos:
 
 ```bash
-echo "hola DFSha" > demo.txt
-
-docker compose --profile tools run --rm \
-  -e DFSHA_TOKEN=dfsha-dev-token \
-  client mkdir /demo
-
-docker compose --profile tools run --rm \
-  -e DFSHA_TOKEN=dfsha-dev-token \
-  -v "$PWD:/host" \
-  client put /host/demo.txt /demo/demo.txt
+docker compose stop dn1
+sleep 10                                 # el ControlNode lo da por muerto a los 9 s
+dfsha get /demo/archivo.bin /host/sin-dn1.bin
+docker compose start dn1
 ```
 
-Listar y descargar:
+Para apagar todo y borrar los datos: `docker compose down -v`.
+
+### Comandos del cliente
+
+| Comando | Qué hace |
+|---|---|
+| `login <usuario> <contraseña>` | Autentica y guarda el token |
+| `ls [ruta]` | Lista un directorio |
+| `mkdir <ruta>` / `rmdir <ruta>` | Crea un directorio / borra uno vacío |
+| `rm <ruta>` | Borra un archivo |
+| `mv <origen> <destino>` | Renombra o mueve un archivo |
+| `stat <ruta>` | Tamaño, bloques, copias vivas y dueño |
+| `put <local> <remoto> [--workers N]` | Sube un archivo partido en bloques |
+| `get <remoto> <local> [--workers N]` | Descarga y reconstruye un archivo |
+
+### Credenciales de demostración
+
+| Valor | |
+|---|---|
+| Usuario / contraseña | `demo` / `demo` |
+| Token | `dfsha-dev-token` |
+| Clave interna del clúster | `dev-cluster-key` |
+
+Son valores **solo de desarrollo**. La seguridad real (HTTPS, cifrado, usuarios) es del Hito 3.
+
+## Configuración
+
+Los parámetros operativos se leen de variables de entorno, así que se cambian sin recompilar:
 
 ```bash
-docker compose --profile tools run --rm \
-  -e DFSHA_TOKEN=dfsha-dev-token \
-  client ls /demo
-
-docker compose --profile tools run --rm \
-  -e DFSHA_TOKEN=dfsha-dev-token \
-  -v "$PWD:/host" \
-  client get /demo/demo.txt /host/demo-descargado.txt
+REPLICATION_FACTOR=1 BLOCK_SIZE_MIN_MB=4 docker compose up -d
 ```
 
-Verificación:
-
-```bash
-sha256sum demo.txt demo-descargado.txt
-```
-
-## Credenciales de demostración
-
-- usuario: `demo`
-- contraseña: `demo`
-- token emitido: `dfsha-dev-token`
-- clave interna de clúster: `dev-cluster-key`
-
-Son valores **solo de desarrollo**. No representan la seguridad final del sistema.
-
-## API implementada
-
-### Cliente → ControlNode
-
-| Método | Ruta | Función |
+| Variable | Por defecto | Qué controla |
 |---|---|---|
-| POST | `/auth/login` | autenticación de demostración |
-| GET | `/fs/ls?path=` | listar directorio |
-| POST | `/fs/mkdir` | crear directorio |
-| DELETE | `/fs/rmdir?path=` | borrar directorio vacío |
-| DELETE | `/fs/rm?path=` | borrar metadatos de archivo |
-| POST | `/fs/mv` | mover/renombrar archivo |
-| GET | `/fs/stat?path=` | metadatos de archivo |
-| POST | `/files/upload/plan` | plan de partición y destinos |
-| POST | `/files/upload/commit` | publicar archivo tras subir bloques |
-| POST | `/files/upload/abort` | cancelar sesión de subida |
-| GET | `/files/download/plan?path=` | plan de lectura con réplicas vivas |
+| `REPLICATION_FACTOR` | 2 | Copias de cada bloque (nunca más de N − 1 DataNodes) |
+| `BLOCK_SIZE_MIN_MB` | 8 | Piso del tamaño de bloque |
+| `BLOCK_SIZE_MAX_MB` | 64 | Techo del tamaño de bloque |
+| `BLOCKS_PER_NODE` | 4 | Bloques mínimos por nodo que debe producir un archivo |
+| `HEARTBEAT_INTERVAL_SECONDS` | 3 | Frecuencia del heartbeat de los DataNodes |
+| `HEARTBEAT_MISSES` | 3 | Heartbeats perdidos para dar por muerto un DataNode |
+| `WRITE_LEASE_TTL_SECONDS` | 60 | Vigencia de la reserva de escritura de un archivo |
 
-### Cliente/DataNode → DataNode
+El detalle de cada parámetro y de dónde sale su valor está en la [documentación del Hito 2](docs/hito-2-arquitectura-y-comunicaciones.md#7-parámetros).
 
-| Método | Ruta | Función |
+## Pruebas
+
+```bash
+go test ./...
+python3 -m unittest discover client
+```
+
+## Documentación
+
+| Documento | Contenido |
+|---|---|
+| [Hito 1 — Especificación](docs/hito-1-especificacion.pdf) | Definición del servicio, arquitectura, algoritmos de particionamiento y replicación, protocolos, infraestructura |
+| [Hito 2 — Arquitectura y comunicaciones](docs/hito-2-arquitectura-y-comunicaciones.md) | Implementación, contratos de API, cambios respecto al Hito 1, pendientes y resultados de pruebas |
+
+## Estado por hito
+
+| Hito | Contenido | Estado |
 |---|---|---|
-| PUT | `/blocks/{sha256}` | almacenar bloque; opcionalmente propagarlo |
-| GET | `/blocks/{sha256}` | recuperar bloque; soporta `Range` |
-| DELETE | `/blocks/{sha256}` | borrar bloque, solo tráfico interno |
-| POST | `/blocks/{sha256}/replicate` | copiar un bloque a otro DataNode |
-| GET | `/health` | salud y uso de disco |
+| 1 | Especificación del proyecto | Entregado |
+| 2 | Arquitectura distribuida y comunicaciones | Implementado |
+| 3 | Alta disponibilidad, replicación, consistencia y seguridad | Pendiente |
+| 4 | Entrega final | Pendiente |
 
-### DataNode → ControlNode
+**Implementado en el Hito 2:** particionamiento con la fórmula del Hito 1, ubicación por menor ocupación, 2 copias por bloque en nodos distintos con tope N − 1, propagación DataNode → DataNode, integridad SHA-256, subidas y descargas en paralelo sin cargar el archivo en memoria, reserva de un solo escritor por archivo (`409`), reintentos con espera creciente en la subida de bloques, lectura desde otra réplica si una falla, y parámetros configurables.
 
-| Método | Ruta | Función |
-|---|---|---|
-| POST | `/cluster/register` | registro inicial |
-| POST | `/cluster/heartbeat` | señal de vida y ocupación |
-| POST | `/cluster/blockreport` | contrato para reporte de inventario |
-
-### Reservado para Hito 3
-
-- `POST /cluster/replicate` entre ControlNodes.
-- `POST /cluster/election` entre ControlNodes.
-
-## Flujo de subida
-
-1. Cliente solicita `POST /files/upload/plan` con ruta y tamaño.
-2. ControlNode valida el namespace y obtiene DataNodes vivos.
-3. Calcula `block_size`, número de bloques y destinos por bloque.
-4. Cliente corta el archivo y calcula SHA-256 por bloque.
-5. Cliente manda cada bloque al primer DataNode; en `X-Forward-To` manda las réplicas adicionales.
-6. El primer DataNode persiste el bloque y lo propaga al segundo.
-7. Cliente hace `POST /files/upload/commit`.
-8. ControlNode publica el archivo en metadatos.
-
-## Flujo de descarga
-
-1. Cliente pide `GET /files/download/plan`.
-2. ControlNode devuelve bloques ordenados y réplicas vivas.
-3. Cliente descarga varios bloques en paralelo.
-4. Si una réplica falla, prueba la siguiente.
-5. Verifica SHA-256 y reconstruye por índice.
-
-## Limitaciones conocidas de este hito
-
-- Los metadatos del ControlNode aún están en memoria.
-- `rm` borra metadatos pero todavía no programa recolección de bloques huérfanos.
-- No hay elección de líder ni réplica de metadatos.
-- No hay HTTPS ni cifrado en disco todavía.
-- El control de acceso es una autenticación de demostración con un único usuario.
-
-Estas limitaciones están alineadas con el cronograma: el Hito 3 agrega alta disponibilidad, replicación/consistencia y seguridad.
+**Pendiente para el Hito 3:** tres ControlNodes con elección de líder, persistencia de metadatos, auto-reparación de copias tras la caída de un nodo (el campo `orders` del heartbeat sigue vacío), rebalanceo y `node_full_threshold`, recolección de bloques huérfanos, HTTPS, cifrado en disco y control de acceso real por usuario. La lista completa, con su justificación, está en la [sección 10 del documento del Hito 2](docs/hito-2-arquitectura-y-comunicaciones.md#10-pendiente-para-el-hito-3).
