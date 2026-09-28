@@ -56,61 +56,80 @@ func (n *Node) blocks(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// putBlock guarda el bloque solo si su SHA-256 coincide con el id, y después
-// lo propaga a los DataNodes indicados en X-Forward-To. Se escribe primero a
-// un .tmp y se renombra, para que nunca quede visible un bloque a medias.
+// putBlock guarda el bloque y lo propaga a los DataNodes de X-Forward-To.
+// Es idempotente: si el bloque ya existe (un reintento del cliente, o el
+// mismo contenido en otro archivo) no se reescribe, pero sí se propaga, para
+// que las demás copias existan igual. Responde 201 si lo creó y 200 si ya estaba.
 func (n *Node) putBlock(w http.ResponseWriter, r *http.Request, id string) {
 	dst := filepath.Join(n.StorageDir, id)
+	status := http.StatusCreated
 	if _, err := os.Stat(dst); err == nil {
-		writeJSON(w, http.StatusOK, map[string]any{"block_id": id, "size": fileSize(dst), "stored_on": []string{n.ID}})
+		// Se consume el cuerpo para que el cliente termine de enviar sin error.
+		_, _ = io.Copy(io.Discard, r.Body)
+		status = http.StatusOK
+	} else if !n.storeVerifiedBlock(w, r.Body, id, dst) {
 		return
 	}
+	stored := append([]string{n.ID}, n.forwardToPeers(r, id, dst)...)
+	writeJSON(w, status, map[string]any{"block_id": id, "size": fileSize(dst), "stored_on": stored})
+}
+
+// storeVerifiedBlock escribe body en dst solo si su SHA-256 coincide con id.
+// Escribe primero a un .tmp y lo renombra, para que nunca quede visible un
+// bloque a medias. Si falla, ya respondió el error y devuelve false.
+func (n *Node) storeVerifiedBlock(w http.ResponseWriter, body io.Reader, id, dst string) bool {
 	tmp := dst + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
+		return false
 	}
 	h := sha256.New()
-	size, err := io.Copy(io.MultiWriter(f, h), r.Body)
+	_, err = io.Copy(io.MultiWriter(f, h), body)
 	closeErr := f.Close()
 	if err != nil || closeErr != nil {
 		_ = os.Remove(tmp)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "falló escritura"})
-		return
+		return false
 	}
-	got := hex.EncodeToString(h.Sum(nil))
-	if got != id {
+	if got := hex.EncodeToString(h.Sum(nil)); got != id {
 		_ = os.Remove(tmp)
 		writeJSON(w, http.StatusConflict, map[string]any{"error": "SHA-256 no coincide", "expected": id, "got": got})
-		return
+		return false
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		_ = os.Remove(tmp)
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return
+		return false
 	}
-	stored := []string{n.ID}
+	return true
+}
+
+// forwardToPeers envía el bloque a cada URL de X-Forward-To y devuelve los
+// node_id que lo recibieron. El node_id de la i-ésima URL viene en la
+// cabecera X-Forward-Node-i (empezando en 1); si falta, se usa la URL.
+func (n *Node) forwardToPeers(r *http.Request, id, file string) []string {
 	forward := strings.TrimSpace(r.Header.Get("X-Forward-To"))
-	if forward != "" {
-		for _, target := range strings.Split(forward, ",") {
-			target = strings.TrimSpace(target)
-			if target == "" {
-				continue
-			}
-			nodeID := r.Header.Get("X-Forward-Node-" + strconv.Itoa(len(stored)))
-			if err := n.forwardFile(target, id, dst); err != nil {
-				log.Printf("forward %s -> %s falló: %v", id, target, err)
-				continue
-			}
-			if nodeID != "" {
-				stored = append(stored, nodeID)
-			} else {
-				stored = append(stored, target)
-			}
-		}
+	if forward == "" {
+		return nil
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"block_id": id, "size": size, "stored_on": stored})
+	stored := []string{}
+	for i, target := range strings.Split(forward, ",") {
+		target = strings.TrimSpace(target)
+		if target == "" {
+			continue
+		}
+		if err := n.forwardFile(target, id, file); err != nil {
+			log.Printf("forward %s -> %s falló: %v", id, target, err)
+			continue
+		}
+		nodeID := r.Header.Get("X-Forward-Node-" + strconv.Itoa(i+1))
+		if nodeID == "" {
+			nodeID = target
+		}
+		stored = append(stored, nodeID)
+	}
+	return stored
 }
 
 // getBlock entrega el bloque; http.ServeContent atiende la cabecera Range.
