@@ -36,6 +36,21 @@ func numberOfBlocks(size, blockSize int64) int {
 	return int((size + blockSize - 1) / blockSize)
 }
 
+// copiesPerBlock decide cuántas copias lleva cada bloque, según el Hito 1 [N4]:
+//   - target: el factor configurado, pero nunca mayor que registered-1 (N-1),
+//     para que siempre exista un DataNode donde rehacer una copia perdida.
+//   - copies: las copias que realmente se pueden guardar ahora. Si hay menos
+//     DataNodes vivos que target, se guardan las posibles en vez de rechazar
+//     la escritura ("Qué pasa al quitar un nodo").
+//
+// Nunca devuelve menos de 1 copia mientras haya al menos un nodo vivo.
+func copiesPerBlock(configured, registered, alive int) (target, copies int) {
+	target = min(configured, registered-1)
+	target = max(target, 1)
+	copies = min(target, alive)
+	return target, copies
+}
+
 // placeBlocks asigna destinos a cada bloque con la heurística voraz del
 // Hito 1 [N5]: cada copia va al DataNode con menor ocupación relativa.
 // La ocupación se actualiza mientras se arma el plan ("carga virtual") para

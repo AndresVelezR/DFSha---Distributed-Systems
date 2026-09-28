@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"path"
 	"sort"
@@ -46,11 +47,11 @@ func (s *Server) uploadPlan(w http.ResponseWriter, r *http.Request) {
 
 	blockSize := chooseBlockSize(req.Size, len(nodes))
 	nBlocks := numberOfBlocks(req.Size, blockSize)
-	rf := replicationFactor
-	if rf > len(nodes) {
-		rf = len(nodes)
+	targetCopies, copies := copiesPerBlock(replicationFactor, len(s.nodes), len(nodes))
+	if copies < targetCopies {
+		log.Printf("aviso: %s se guarda con %d copia(s) de %d, solo hay %d DataNode(s) vivo(s)", remote, copies, targetCopies, len(nodes))
 	}
-	plans := placeBlocks(nodes, nBlocks, blockSize, rf)
+	plans := placeBlocks(nodes, nBlocks, blockSize, copies)
 
 	up := &UploadSession{
 		UploadID:  newUploadID(),
