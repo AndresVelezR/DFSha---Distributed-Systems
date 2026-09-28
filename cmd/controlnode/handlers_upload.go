@@ -39,6 +39,10 @@ func (s *Server) uploadPlan(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "directorio padre no existe"})
 		return
 	}
+	if s.hasActiveReservation(remote) {
+		writeJSON(w, http.StatusConflict, map[string]any{"error": "reserva activa para esta ruta"})
+		return
+	}
 	nodes := s.aliveNodes()
 	if len(nodes) == 0 {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no hay DataNodes vivos"})
@@ -127,6 +131,25 @@ func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
 	delete(s.uploads, req.UploadID)
 	s.mu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// hasActiveReservation dice si otra subida tiene reservada la ruta, para que
+// un archivo lo escriba un solo cliente a la vez [Hito 1, N8]. Las reservas
+// vencidas de esa ruta se descartan: así la reserva de un cliente que murió
+// se libera sola. Debe llamarse con s.mu tomado para escritura.
+func (s *Server) hasActiveReservation(remote string) bool {
+	now := time.Now()
+	for id, up := range s.uploads {
+		if up.Path != remote {
+			continue
+		}
+		if now.After(up.ExpiresAt) {
+			delete(s.uploads, id)
+			continue
+		}
+		return true
+	}
+	return false
 }
 
 func newUploadID() string {
