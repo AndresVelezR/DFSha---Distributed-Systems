@@ -4,7 +4,8 @@
 #   2. Sube un archivo de 40 MB, que se parte en varios bloques con 2 copias cada uno.
 #   3. Muestra que una segunda reserva sobre la misma ruta se rechaza con 409.
 #   4. Apaga un DataNode y descarga el archivo usando las réplicas restantes.
-#   5. Compara la firma SHA-256 del original con las de las descargas.
+#   5. Agrega un cuarto DataNode en caliente y muestra que recibe bloques nuevos.
+#   6. Compara la firma SHA-256 del original con las de las descargas.
 set -eu
 
 WORKDIR=demo-files
@@ -48,5 +49,12 @@ curl -s "$CONTROL/health"; echo
 dfsha get /demo/original.bin /host/descargado-sin-dn1.bin
 docker compose start dn1
 
-echo "== 5. Las tres firmas deben ser iguales"
+echo "== 5. Escalado: se agrega dn4 con el clúster en marcha"
+docker compose --profile scale up -d dn4
+sleep 5
+curl -s "$CONTROL/health"; echo
+head -c 40000000 /dev/urandom > "$WORKDIR/despues-de-dn4.bin"
+dfsha put /host/despues-de-dn4.bin /demo/despues-de-dn4.bin
+
+echo "== 6. Las tres firmas deben ser iguales"
 sha256sum "$WORKDIR/original.bin" "$WORKDIR/descargado.bin" "$WORKDIR/descargado-sin-dn1.bin"

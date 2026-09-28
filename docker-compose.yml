@@ -65,6 +65,21 @@ services:
       STORAGE_DIR: /data
     volumes: [dn3:/data]
 
+  # Cuarto DataNode, apagado por defecto. Sirve para demostrar que un nodo se
+  # agrega con el clúster en marcha, sin reiniciar ni reconfigurar nada
+  # (Hito 1, vm-04): docker compose --profile scale up -d dn4
+  dn4:
+    <<: *datanode
+    profiles: [scale]
+    environment:
+      <<: *cluster-env
+      NODE_ID: dn-04
+      ADVERTISE_HOST: dn4
+      PORT: 8001
+      CONTROL_URL: http://controlnode:8000
+      STORAGE_DIR: /data
+    volumes: [dn4:/data]
+
   # Herramienta de línea de comandos, no un servicio: se usa con
   # "docker compose run --rm client <comando>" con el clúster ya levantado.
   # No declara depends_on para no volver a encender un DataNode que se
@@ -83,6 +98,7 @@ volumes:
   dn1:
   dn2:
   dn3:
+  dn4:
 
 networks:
   dfsha:
