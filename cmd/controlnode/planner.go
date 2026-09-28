@@ -51,6 +51,18 @@ func copiesPerBlock(configured, registered, alive int) (target, copies int) {
 	return target, copies
 }
 
+// fitsInCluster dice si un archivo de size bytes, guardado con copies copias,
+// cabe en el espacio libre sumado de los DataNodes vivos. Así una carga que no
+// cabe se rechaza de entrada en vez de fallar a mitad de camino [Hito 1,
+// "Sobre el tamaño máximo de archivo"].
+func fitsInCluster(nodes []*NodeInfo, size int64, copies int) bool {
+	var free int64
+	for _, n := range nodes {
+		free += max(n.Capacity-n.Used, 0)
+	}
+	return size*int64(copies) <= free
+}
+
 // placeBlocks asigna destinos a cada bloque con la heurística voraz del
 // Hito 1 [N5]: cada copia va al DataNode con menor ocupación relativa.
 // La ocupación se actualiza mientras se arma el plan ("carga virtual") para

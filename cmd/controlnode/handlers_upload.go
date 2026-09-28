@@ -52,6 +52,10 @@ func (s *Server) uploadPlan(w http.ResponseWriter, r *http.Request) {
 	blockSize := chooseBlockSize(req.Size, len(nodes), s.cfg.BlockSizing)
 	nBlocks := numberOfBlocks(req.Size, blockSize)
 	targetCopies, copies := copiesPerBlock(s.cfg.ReplicationFactor, len(s.nodes), len(nodes))
+	if !fitsInCluster(nodes, req.Size, copies) {
+		writeJSON(w, http.StatusInsufficientStorage, map[string]any{"error": "no hay espacio suficiente en el clúster"})
+		return
+	}
 	if copies < targetCopies {
 		log.Printf("aviso: %s se guarda con %d copia(s) de %d, solo hay %d DataNode(s) vivo(s)", remote, copies, targetCopies, len(nodes))
 	}

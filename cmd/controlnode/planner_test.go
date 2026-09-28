@@ -104,3 +104,16 @@ func TestPlaceBlocksPrefersEmptierNode(t *testing.T) {
 		t.Errorf("el bloque fue a %s, se esperaba el nodo más vacío dn-02", got)
 	}
 }
+
+func TestFitsInCluster(t *testing.T) {
+	nodes := []*NodeInfo{
+		{NodeID: "dn-01", Capacity: 100, Used: 60}, // 40 libres
+		{NodeID: "dn-02", Capacity: 100, Used: 40}, // 60 libres
+	}
+	if !fitsInCluster(nodes, 50, 2) {
+		t.Error("50 bytes x 2 copias = 100 deberían caber en 100 libres")
+	}
+	if fitsInCluster(nodes, 51, 2) {
+		t.Error("51 bytes x 2 copias = 102 no deberían caber en 100 libres")
+	}
+}

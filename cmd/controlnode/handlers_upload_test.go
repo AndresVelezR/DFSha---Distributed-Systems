@@ -91,3 +91,19 @@ func TestUploadPlanCopiesPerBlock(t *testing.T) {
 		}
 	}
 }
+
+func TestUploadPlanRejectsFileThatDoesNotFit(t *testing.T) {
+	s := newTestServer(t, 3) // 3 nodos con 1000 MB libres cada uno
+	// 2 GB x 2 copias = 4 GB, más que los 3 GB libres del clúster.
+	body := `{"path":"/enorme.bin","size":2000000000}`
+	req := httptest.NewRequest(http.MethodPost, "/files/upload/plan", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+demoToken)
+	rec := httptest.NewRecorder()
+	s.routes().ServeHTTP(rec, req)
+	if rec.Code != http.StatusInsufficientStorage {
+		t.Fatalf("código %d, se esperaba 507", rec.Code)
+	}
+	if len(s.uploads) != 0 {
+		t.Fatal("una subida rechazada no debe dejar la ruta reservada")
+	}
+}
