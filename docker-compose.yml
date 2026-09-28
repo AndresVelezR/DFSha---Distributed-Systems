@@ -89,6 +89,7 @@ services:
   # detuvo a propósito (por ejemplo, en la prueba de tolerancia a fallos).
   client:
     image: dfsha-client
+    pull_policy: build # se construye siempre desde el código, nunca queda desactualizado
     build:
       context: .
       dockerfile: docker/client.Dockerfile
