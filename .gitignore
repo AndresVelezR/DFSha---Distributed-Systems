@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Binarios de Go compilados localmente
+/controlnode
+/datanode
+
+# Archivos generados por scripts/demo.sh y descargas parciales
+/demo-files/
+*.part
+
+# Entorno local
+.env
+.idea/
+.vscode/
+.DS_Store

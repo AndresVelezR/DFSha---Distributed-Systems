@@ -1,0 +1,76 @@
+services:
+  controlnode:
+    build:
+      context: .
+      dockerfile: Dockerfile.control
+    environment:
+      NODE_ID: cn-01
+      CLUSTER_KEY: dev-cluster-key
+    ports:
+      - "8000:8000"
+    networks: [dfsha]
+
+  dn1:
+    build:
+      context: .
+      dockerfile: Dockerfile.data
+    environment:
+      NODE_ID: dn-01
+      ADVERTISE_HOST: dn1
+      PORT: 8001
+      CONTROL_URL: http://controlnode:8000
+      STORAGE_DIR: /data
+      CLUSTER_KEY: dev-cluster-key
+    volumes: [dn1:/data]
+    depends_on: [controlnode]
+    networks: [dfsha]
+
+  dn2:
+    build:
+      context: .
+      dockerfile: Dockerfile.data
+    environment:
+      NODE_ID: dn-02
+      ADVERTISE_HOST: dn2
+      PORT: 8001
+      CONTROL_URL: http://controlnode:8000
+      STORAGE_DIR: /data
+      CLUSTER_KEY: dev-cluster-key
+    volumes: [dn2:/data]
+    depends_on: [controlnode]
+    networks: [dfsha]
+
+  dn3:
+    build:
+      context: .
+      dockerfile: Dockerfile.data
+    environment:
+      NODE_ID: dn-03
+      ADVERTISE_HOST: dn3
+      PORT: 8001
+      CONTROL_URL: http://controlnode:8000
+      STORAGE_DIR: /data
+      CLUSTER_KEY: dev-cluster-key
+    volumes: [dn3:/data]
+    depends_on: [controlnode]
+    networks: [dfsha]
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.client
+    environment:
+      DFSHA_CONTROL: http://controlnode:8000
+      HOME: /tmp
+    depends_on: [controlnode, dn1, dn2, dn3]
+    networks: [dfsha]
+    profiles: [tools]
+
+volumes:
+  dn1:
+  dn2:
+  dn3:
+
+networks:
+  dfsha:
+    driver: bridge
