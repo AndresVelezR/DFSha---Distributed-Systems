@@ -55,23 +55,29 @@ func (s *Server) fsLS(w http.ResponseWriter, r *http.Request) {
 		if rest == "" || strings.Contains(rest, "/") {
 			continue
 		}
-		entries = append(entries, map[string]any{"name": rest, "type": "file", "size": f.Size, "blocks": len(f.Blocks), "replicas_ok": minReplicas(f.Blocks)})
+		entries = append(entries, map[string]any{"name": rest, "type": "file", "size": f.Size, "blocks": len(f.Blocks), "replicas_ok": s.liveReplicas(f.Blocks)})
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i]["name"].(string) < entries[j]["name"].(string) })
 	writeJSON(w, http.StatusOK, map[string]any{"path": base, "entries": entries})
 }
 
-// minReplicas devuelve el menor número de copias entre los bloques de un
-// archivo: el archivo es tan redundante como su bloque menos replicado.
-func minReplicas(blocks []StoredBlock) int {
-	if len(blocks) == 0 {
-		return 0
+// liveReplicas devuelve cuántas copias en DataNodes vivos tiene el bloque
+// menos replicado del archivo: el archivo es tan redundante como su bloque
+// más débil. Debe llamarse con s.mu tomado.
+func (s *Server) liveReplicas(blocks []StoredBlock) int {
+	lowest := -1
+	for _, b := range blocks {
+		alive := 0
+		for _, id := range b.StoredOn {
+			if n, ok := s.nodes[id]; ok && s.isAlive(n) {
+				alive++
+			}
+		}
+		if lowest == -1 || alive < lowest {
+			lowest = alive
+		}
 	}
-	m := len(blocks[0].StoredOn)
-	for _, b := range blocks[1:] {
-		m = min(m, len(b.StoredOn))
-	}
-	return m
+	return max(lowest, 0)
 }
 
 func (s *Server) fsMkdir(w http.ResponseWriter, r *http.Request) {
@@ -201,5 +207,5 @@ func (s *Server) fsStat(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]any{"error": "archivo no existe"})
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"size": f.Size, "block_size": f.BlockSize, "n_blocks": len(f.Blocks), "replicas_ok": minReplicas(f.Blocks), "owner": f.Owner})
+	writeJSON(w, http.StatusOK, map[string]any{"size": f.Size, "block_size": f.BlockSize, "n_blocks": len(f.Blocks), "replicas_ok": s.liveReplicas(f.Blocks), "owner": f.Owner})
 }
