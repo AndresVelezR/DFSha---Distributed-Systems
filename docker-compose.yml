@@ -2,7 +2,7 @@ services:
   controlnode:
     build:
       context: .
-      dockerfile: Dockerfile.control
+      dockerfile: docker/controlnode.Dockerfile
     environment:
       NODE_ID: cn-01
       CLUSTER_KEY: dev-cluster-key
@@ -13,7 +13,7 @@ services:
   dn1:
     build:
       context: .
-      dockerfile: Dockerfile.data
+      dockerfile: docker/datanode.Dockerfile
     environment:
       NODE_ID: dn-01
       ADVERTISE_HOST: dn1
@@ -28,7 +28,7 @@ services:
   dn2:
     build:
       context: .
-      dockerfile: Dockerfile.data
+      dockerfile: docker/datanode.Dockerfile
     environment:
       NODE_ID: dn-02
       ADVERTISE_HOST: dn2
@@ -43,7 +43,7 @@ services:
   dn3:
     build:
       context: .
-      dockerfile: Dockerfile.data
+      dockerfile: docker/datanode.Dockerfile
     environment:
       NODE_ID: dn-03
       ADVERTISE_HOST: dn3
@@ -58,7 +58,7 @@ services:
   client:
     build:
       context: .
-      dockerfile: Dockerfile.client
+      dockerfile: docker/client.Dockerfile
     environment:
       DFSHA_CONTROL: http://controlnode:8000
       HOME: /tmp

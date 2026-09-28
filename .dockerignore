@@ -1,0 +1,5 @@
+.git
+docs
+demo-files
+**/__pycache__
+**/*.pyc
