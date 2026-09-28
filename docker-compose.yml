@@ -65,6 +65,10 @@ services:
       STORAGE_DIR: /data
     volumes: [dn3:/data]
 
+  # Herramienta de línea de comandos, no un servicio: se usa con
+  # "docker compose run --rm client <comando>" con el clúster ya levantado.
+  # No declara depends_on para no volver a encender un DataNode que se
+  # detuvo a propósito (por ejemplo, en la prueba de tolerancia a fallos).
   client:
     build:
       context: .
@@ -72,7 +76,6 @@ services:
     environment:
       DFSHA_CONTROL: http://controlnode:8000
       HOME: /tmp
-    depends_on: [controlnode, dn1, dn2, dn3]
     networks: [dfsha]
     profiles: [tools]
 
