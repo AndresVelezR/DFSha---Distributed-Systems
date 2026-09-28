@@ -128,6 +128,19 @@ class DfshaClient:
     # --- RF2: transferencia de archivos -----------------------------------
 
     def put(self, local_path, remote_path, workers=DEFAULT_WORKERS):
+        """Sube un archivo. Si la reserva vence antes del commit (410), pide un
+        plan nuevo y repite una vez [Hito 1, cap. 3]. Los bloques que ya se
+        subieron no se duplican, porque su id es la firma de su contenido.
+        """
+        try:
+            self._put_once(local_path, remote_path, workers)
+        except DfshaHttpError as error:
+            if error.status != 410:
+                raise
+            print("La reserva venció antes de confirmar la subida; se pide un plan nuevo", file=sys.stderr)
+            self._put_once(local_path, remote_path, workers)
+
+    def _put_once(self, local_path, remote_path, workers):
         size = os.path.getsize(local_path)
         plan = self._control("POST", "/files/upload/plan", json_body={"path": remote_path, "size": size})
         block_size = plan["block_size"]
@@ -148,7 +161,6 @@ class DfshaClient:
                 raise
 
         stored_blocks.sort(key=lambda block: block["index"])
-        # TODO Hito 3: si el commit responde 410 (reserva vencida), pedir un plan nuevo.
         commit = self._control("POST", "/files/upload/commit", json_body={"upload_id": plan["upload_id"], "blocks": stored_blocks})
         print_json(commit)
 

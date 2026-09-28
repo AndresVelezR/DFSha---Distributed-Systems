@@ -38,6 +38,25 @@ class NetworkRetriesTest(unittest.TestCase):
         self.sleep.assert_not_called()
 
 
+class ExpiredReservationTest(unittest.TestCase):
+    def setUp(self):
+        stderr = mock.patch("sys.stderr")
+        stderr.start()
+        self.addCleanup(stderr.stop)
+        self.client = dfsha.DfshaClient("http://controlnode:8000")
+
+    def test_requests_a_new_plan_once_when_commit_returns_410(self):
+        with mock.patch.object(self.client, "_put_once", side_effect=[dfsha.DfshaHttpError(410, "reserva vencida"), None]) as put_once:
+            self.client.put("local.bin", "/remoto.bin")
+        self.assertEqual(put_once.call_count, 2)
+
+    def test_other_server_errors_are_not_retried(self):
+        with mock.patch.object(self.client, "_put_once", side_effect=dfsha.DfshaHttpError(409, "reserva activa")) as put_once:
+            with self.assertRaises(dfsha.DfshaHttpError):
+                self.client.put("local.bin", "/remoto.bin")
+        self.assertEqual(put_once.call_count, 1)
+
+
 class BlockFileIoTest(unittest.TestCase):
     def test_blocks_written_out_of_order_rebuild_the_file(self):
         original = os.urandom(25)
