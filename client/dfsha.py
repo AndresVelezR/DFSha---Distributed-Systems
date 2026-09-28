@@ -7,9 +7,11 @@ configuración: las recibe en cada plan.
 """
 import argparse
 import hashlib
+import http.client
 import json
 import os
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -20,6 +22,11 @@ DEFAULT_CONTROL_URL = "http://localhost:8000"
 DEFAULT_WORKERS = 4
 BLOCK_TIMEOUT_SECONDS = 300
 
+# Espera antes de cada reintento de una escritura de bloque [Hito 1, cap. 3].
+RETRY_WAITS_SECONDS = (1, 2, 4)
+# Fallos de red: no hubo respuesta del servidor, así que reintentar es seguro.
+NETWORK_ERRORS = (urllib.error.URLError, ConnectionError, TimeoutError, http.client.HTTPException)
+
 
 class DfshaHttpError(RuntimeError):
     """El servidor respondió con un código de error HTTP."""
@@ -27,6 +34,24 @@ class DfshaHttpError(RuntimeError):
     def __init__(self, status, body):
         super().__init__(f"HTTP {status}: {body}")
         self.status = status
+
+
+def with_network_retries(action, description):
+    """Ejecuta action y, si falla por red, la reintenta hasta 3 veces (1s, 2s, 4s).
+
+    Es seguro porque subir un bloque es idempotente: su id es la firma de su
+    contenido. Una respuesta de error del servidor (DfshaHttpError) no es un
+    fallo de red y se propaga sin reintentar.
+    """
+    for attempt, wait in enumerate(RETRY_WAITS_SECONDS, start=1):
+        try:
+            return action()
+        except DfshaHttpError:
+            raise
+        except NETWORK_ERRORS as error:
+            print(f"  fallo de red en {description} ({error}); reintento {attempt}/{len(RETRY_WAITS_SECONDS)} en {wait}s", file=sys.stderr)
+            time.sleep(wait)
+    return action()
 
 
 class DfshaClient:
@@ -128,11 +153,15 @@ class DfshaClient:
                 raise
 
         stored_blocks.sort(key=lambda block: block["index"])
-        commit = self._control("POST", "/files/upload/commit", json_body={"upload_id": plan["upload_id"], "blocks": stored_blocks})
+        # TODO Hito 3: si el commit responde 410 (reserva vencida), pedir un plan nuevo.
+        commit =self._control("POST", "/files/upload/commit", json_body={"upload_id": plan["upload_id"], "blocks": stored_blocks})
         print_json(commit)
 
     def _upload_block(self, block_plan, data):
-        """Sube el bloque al primer destino, que lo propaga a los demás."""
+        """Sube el bloque al primer destino, que lo propaga a los demás.
+
+        Ante un fallo de red reintenta contra el mismo destino (ver with_network_retries).
+        """
         block_id = hashlib.sha256(data).hexdigest()
         first, *others = block_plan["targets"]
         headers = {"Content-Type": "application/octet-stream"}
@@ -140,7 +169,10 @@ class DfshaClient:
             headers["X-Forward-To"] = ",".join(f"http://{t['host']}:{t['port']}" for t in others)
             for position, target in enumerate(others, start=1):
                 headers[f"X-Forward-Node-{position}"] = target["node"]
-        response = self._request("PUT", self._block_url(first, block_id), data=data, headers=headers, timeout=BLOCK_TIMEOUT_SECONDS)
+        response = with_network_retries(
+            lambda: self._request("PUT", self._block_url(first, block_id), data=data, headers=headers, timeout=BLOCK_TIMEOUT_SECONDS),
+            f"bloque {block_plan['index']} -> {first['node']}",
+        )
         stored_on = response.get("stored_on", [t["node"] for t in block_plan["targets"]])
         return {"index": block_plan["index"], "block_id": block_id, "size": len(data), "stored_on": stored_on}
 
@@ -159,7 +191,11 @@ class DfshaClient:
         print(f"Archivo reconstruido en {local_path} ({os.path.getsize(local_path)} bytes)")
 
     def _download_block(self, block):
-        """Descarga el bloque de la primera réplica que responda con la firma correcta."""
+        """Descarga el bloque de la primera réplica que responda con la firma correcta.
+
+        Según el Hito 1, en lectura no se reintenta la misma réplica: si una no
+        responde, se pasa de inmediato a la siguiente.
+        """
         last_error = None
         for replica in block["replicas"]:
             try:
