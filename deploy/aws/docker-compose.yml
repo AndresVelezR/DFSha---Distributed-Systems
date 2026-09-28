@@ -10,6 +10,7 @@ x-parameters: &parameters
 services:
   controlnode:
     profiles: [controlnode]
+    image: dfsha-controlnode
     build:
       context: ../..
       dockerfile: docker/controlnode.Dockerfile
@@ -28,6 +29,7 @@ services:
 
   datanode:
     profiles: [datanode]
+    image: dfsha-datanode
     build:
       context: ../..
       dockerfile: docker/datanode.Dockerfile

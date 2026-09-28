@@ -7,7 +7,9 @@ x-cluster-env: &cluster-env
   CLUSTER_KEY: dev-cluster-key
   HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-3}
 
+# Todos los DataNodes usan la misma imagen, construida una sola vez.
 x-datanode: &datanode
+  image: dfsha-datanode
   build:
     context: .
     dockerfile: docker/datanode.Dockerfile
@@ -16,6 +18,7 @@ x-datanode: &datanode
 
 services:
   controlnode:
+    image: dfsha-controlnode
     build:
       context: .
       dockerfile: docker/controlnode.Dockerfile
@@ -85,6 +88,7 @@ services:
   # No declara depends_on para no volver a encender un DataNode que se
   # detuvo a propósito (por ejemplo, en la prueba de tolerancia a fallos).
   client:
+    image: dfsha-client
     build:
       context: .
       dockerfile: docker/client.Dockerfile
