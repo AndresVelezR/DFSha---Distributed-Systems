@@ -49,9 +49,9 @@ func (s *Server) uploadPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	blockSize := chooseBlockSize(req.Size, len(nodes))
+	blockSize := chooseBlockSize(req.Size, len(nodes), s.cfg.BlockSizing)
 	nBlocks := numberOfBlocks(req.Size, blockSize)
-	targetCopies, copies := copiesPerBlock(replicationFactor, len(s.nodes), len(nodes))
+	targetCopies, copies := copiesPerBlock(s.cfg.ReplicationFactor, len(s.nodes), len(nodes))
 	if copies < targetCopies {
 		log.Printf("aviso: %s se guarda con %d copia(s) de %d, solo hay %d DataNode(s) vivo(s)", remote, copies, targetCopies, len(nodes))
 	}
@@ -64,7 +64,7 @@ func (s *Server) uploadPlan(w http.ResponseWriter, r *http.Request) {
 		Size:      req.Size,
 		BlockSize: blockSize,
 		NBlocks:   nBlocks,
-		ExpiresAt: time.Now().Add(60 * time.Second),
+		ExpiresAt: time.Now().Add(s.cfg.WriteLeaseTTL),
 		Blocks:    plans,
 	}
 	s.uploads[up.UploadID] = up

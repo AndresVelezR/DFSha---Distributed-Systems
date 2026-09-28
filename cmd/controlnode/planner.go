@@ -10,21 +10,21 @@ import (
 // pueden probar de forma aislada.
 
 // chooseBlockSize aplica la fórmula del Hito 1 [N3]:
-// B = clamp(blockMin, size / (blocksPerNode · nodes), blockMax),
+// B = clamp(Min, size / (BlocksPerNode · nodes), Max),
 // redondeado a la potencia de dos inferior.
-func chooseBlockSize(size int64, nodes int) int64 {
+func chooseBlockSize(size int64, nodes int, p BlockSizing) int64 {
 	if size <= 0 || nodes <= 0 {
-		return blockMin
+		return p.Min
 	}
-	proposed := size / (blocksPerNode * int64(nodes))
-	if proposed < blockMin {
-		return blockMin
+	proposed := size / (p.BlocksPerNode * int64(nodes))
+	if proposed < p.Min {
+		return p.Min
 	}
-	if proposed > blockMax {
-		return blockMax
+	if proposed > p.Max {
+		return p.Max
 	}
 	powerOfTwo := int64(1) << (63 - bits.LeadingZeros64(uint64(proposed)))
-	return max(powerOfTwo, blockMin)
+	return max(powerOfTwo, p.Min)
 }
 
 // numberOfBlocks es cuántos bloques de blockSize hacen falta para size bytes.

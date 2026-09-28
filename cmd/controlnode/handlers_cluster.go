@@ -12,11 +12,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.RUnlock()
 	alive := 0
 	for _, n := range s.nodes {
-		if isAlive(n) {
+		if s.isAlive(n) {
 			alive++
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"node_id": getenv("NODE_ID", "cn-01"), "role": "leader-hito2", "alive_datanodes": alive, "files": len(s.files)})
+	writeJSON(w, http.StatusOK, map[string]any{"node_id": s.cfg.NodeID, "role": "leader-hito2", "alive_datanodes": alive, "files": len(s.files)})
 }
 
 // clusterRegister da de alta un DataNode. Un nodo nuevo solo tiene que

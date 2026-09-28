@@ -6,31 +6,17 @@ package main
 import (
 	"log"
 	"net/http"
-	"os"
-	"time"
-)
-
-const (
-	demoUser          = "demo"
-	demoPassword      = "demo"
-	demoToken         = "dfsha-dev-token"
-	replicationFactor = 2
-	blockMin          = int64(8 * 1024 * 1024)
-	blockMax          = int64(64 * 1024 * 1024)
-	blocksPerNode     = int64(4)
-	heartbeatTimeout  = 10 * time.Second
 )
 
 func main() {
-	addr := getenv("CN_ADDR", ":8000")
-	s := newServer()
-	log.Printf("ControlNode escuchando en %s", addr)
-	log.Fatal(http.ListenAndServe(addr, s.routes()))
-}
-
-func getenv(k, d string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("configuración inválida: %v", err)
 	}
-	return d
+	s := newServer(cfg)
+	log.Printf("ControlNode %s escuchando en %s (replication_factor=%d, bloque=%d-%d MB, k=%d, nodo muerto tras %s)",
+		cfg.NodeID, cfg.Addr, cfg.ReplicationFactor,
+		cfg.BlockSizing.Min/megabyte, cfg.BlockSizing.Max/megabyte, cfg.BlockSizing.BlocksPerNode,
+		cfg.HeartbeatTimeout())
+	log.Fatal(http.ListenAndServe(cfg.Addr, s.routes()))
 }

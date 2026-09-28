@@ -23,3 +23,11 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"token": demoToken, "expires_in": 3600})
 }
+
+// Credenciales de demostración de este hito. No son configurables a propósito:
+// se reemplazan por usuarios reales y tokens firmados en el Hito 3.
+const (
+	demoUser     = "demo"
+	demoPassword = "demo"
+	demoToken    = "dfsha-dev-token"
+)

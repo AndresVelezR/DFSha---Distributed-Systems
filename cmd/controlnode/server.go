@@ -9,6 +9,7 @@ import (
 // Server guarda todo el estado del ControlNode. En este hito vive en memoria;
 // la persistencia y la réplica entre ControlNodes llegan en el Hito 3.
 type Server struct {
+	cfg     Config
 	mu      sync.RWMutex
 	nodes   map[string]*NodeInfo      // DataNodes registrados, por node_id
 	uploads map[string]*UploadSession // subidas en curso, por upload_id
@@ -16,8 +17,9 @@ type Server struct {
 	dirs    map[string]bool           // directorios existentes, por ruta
 }
 
-func newServer() *Server {
+func newServer(cfg Config) *Server {
 	return &Server{
+		cfg:     cfg,
 		nodes:   map[string]*NodeInfo{},
 		uploads: map[string]*UploadSession{},
 		files:   map[string]*FileMeta{},
@@ -56,7 +58,7 @@ func (s *Server) routes() http.Handler {
 func (s *Server) aliveNodes() []*NodeInfo {
 	nodes := []*NodeInfo{}
 	for _, n := range s.nodes {
-		if isAlive(n) {
+		if s.isAlive(n) {
 			copyN := *n
 			nodes = append(nodes, &copyN)
 		}
@@ -64,6 +66,7 @@ func (s *Server) aliveNodes() []*NodeInfo {
 	return nodes
 }
 
-func isAlive(n *NodeInfo) bool {
-	return time.Since(n.LastSeen) <= heartbeatTimeout
+// isAlive dice si el DataNode mandó heartbeat dentro del plazo configurado.
+func (s *Server) isAlive(n *NodeInfo) bool {
+	return time.Since(n.LastSeen) <= s.cfg.HeartbeatTimeout()
 }

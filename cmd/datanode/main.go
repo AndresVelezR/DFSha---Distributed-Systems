@@ -7,30 +7,25 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"time"
 )
 
 // Node es la configuración de este DataNode y de a quién le habla.
 type Node struct {
-	ID          string
-	Host        string // dirección con la que otros nodos y el cliente lo alcanzan
-	Port        int
-	ControlURL  string
-	StorageDir  string
-	ClusterKey  string
-	ClientToken string
+	ID                string
+	Host              string // dirección con la que otros nodos y el cliente lo alcanzan
+	Port              int
+	ControlURL        string
+	StorageDir        string
+	ClusterKey        string
+	ClientToken       string
+	HeartbeatInterval time.Duration
 }
 
 func main() {
-	port, _ := strconv.Atoi(getenv("PORT", "8001"))
-	n := &Node{
-		ID:          getenv("NODE_ID", "dn-01"),
-		Host:        getenv("ADVERTISE_HOST", "localhost"),
-		Port:        port,
-		ControlURL:  getenv("CONTROL_URL", "http://localhost:8000"),
-		StorageDir:  getenv("STORAGE_DIR", "./data"),
-		ClusterKey:  getenv("CLUSTER_KEY", "dev-cluster-key"),
-		ClientToken: getenv("CLIENT_TOKEN", "dfsha-dev-token"),
+	n, err := loadNode()
+	if err != nil {
+		log.Fatalf("configuración inválida: %v", err)
 	}
 	if err := os.MkdirAll(n.StorageDir, 0755); err != nil {
 		log.Fatal(err)
@@ -41,7 +36,7 @@ func main() {
 	go n.heartbeatLoop()
 
 	addr := fmt.Sprintf(":%d", n.Port)
-	log.Printf("DataNode %s escuchando en %s, almacenamiento=%s", n.ID, addr, n.StorageDir)
+	log.Printf("DataNode %s escuchando en %s, almacenamiento=%s, heartbeat cada %s", n.ID, addr, n.StorageDir, n.HeartbeatInterval)
 	log.Fatal(http.ListenAndServe(addr, n.routes()))
 }
 
@@ -50,11 +45,4 @@ func (n *Node) routes() http.Handler {
 	mux.HandleFunc("/health", n.health)
 	mux.HandleFunc("/blocks/", n.blocks)
 	return mux
-}
-
-func getenv(k, d string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return d
 }

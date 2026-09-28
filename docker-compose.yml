@@ -1,59 +1,69 @@
+# Clúster local de DFSha: 1 ControlNode y 3 DataNodes en una red privada.
+# Los parámetros operativos se pueden cambiar sin recompilar, por ejemplo:
+#   REPLICATION_FACTOR=1 docker compose up -d
+# o dejándolos en un archivo .env junto a este archivo.
+
+x-cluster-env: &cluster-env
+  CLUSTER_KEY: dev-cluster-key
+  HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-3}
+
+x-datanode: &datanode
+  build:
+    context: .
+    dockerfile: docker/datanode.Dockerfile
+  depends_on: [controlnode]
+  networks: [dfsha]
+
 services:
   controlnode:
     build:
       context: .
       dockerfile: docker/controlnode.Dockerfile
     environment:
+      <<: *cluster-env
       NODE_ID: cn-01
-      CLUSTER_KEY: dev-cluster-key
+      REPLICATION_FACTOR: ${REPLICATION_FACTOR:-2}
+      BLOCK_SIZE_MIN_MB: ${BLOCK_SIZE_MIN_MB:-8}
+      BLOCK_SIZE_MAX_MB: ${BLOCK_SIZE_MAX_MB:-64}
+      BLOCKS_PER_NODE: ${BLOCKS_PER_NODE:-4}
+      HEARTBEAT_MISSES: ${HEARTBEAT_MISSES:-3}
+      WRITE_LEASE_TTL_SECONDS: ${WRITE_LEASE_TTL_SECONDS:-60}
     ports:
       - "8000:8000"
     networks: [dfsha]
 
   dn1:
-    build:
-      context: .
-      dockerfile: docker/datanode.Dockerfile
+    <<: *datanode
     environment:
+      <<: *cluster-env
       NODE_ID: dn-01
       ADVERTISE_HOST: dn1
       PORT: 8001
       CONTROL_URL: http://controlnode:8000
       STORAGE_DIR: /data
-      CLUSTER_KEY: dev-cluster-key
     volumes: [dn1:/data]
-    depends_on: [controlnode]
-    networks: [dfsha]
 
   dn2:
-    build:
-      context: .
-      dockerfile: docker/datanode.Dockerfile
+    <<: *datanode
     environment:
+      <<: *cluster-env
       NODE_ID: dn-02
       ADVERTISE_HOST: dn2
       PORT: 8001
       CONTROL_URL: http://controlnode:8000
       STORAGE_DIR: /data
-      CLUSTER_KEY: dev-cluster-key
     volumes: [dn2:/data]
-    depends_on: [controlnode]
-    networks: [dfsha]
 
   dn3:
-    build:
-      context: .
-      dockerfile: docker/datanode.Dockerfile
+    <<: *datanode
     environment:
+      <<: *cluster-env
       NODE_ID: dn-03
       ADVERTISE_HOST: dn3
       PORT: 8001
       CONTROL_URL: http://controlnode:8000
       STORAGE_DIR: /data
-      CLUSTER_KEY: dev-cluster-key
     volumes: [dn3:/data]
-    depends_on: [controlnode]
-    networks: [dfsha]
 
   client:
     build:

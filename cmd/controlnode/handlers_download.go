@@ -22,7 +22,7 @@ func (s *Server) downloadPlan(w http.ResponseWriter, r *http.Request) {
 	for _, b := range f.Blocks {
 		replicas := []Target{}
 		for _, id := range b.StoredOn {
-			if n, ok := s.nodes[id]; ok && isAlive(n) {
+			if n, ok := s.nodes[id]; ok && s.isAlive(n) {
 				replicas = append(replicas, Target{Node: n.NodeID, Host: n.Host, Port: n.Port})
 			}
 		}

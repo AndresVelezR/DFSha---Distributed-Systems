@@ -22,7 +22,7 @@ func (n *Node) register() error {
 // usa. Si el ControlNode no lo reconoce (por ejemplo, porque se reinició),
 // vuelve a registrarse.
 func (n *Node) heartbeatLoop() {
-	ticker := time.NewTicker(3 * time.Second)
+	ticker := time.NewTicker(n.HeartbeatInterval)
 	defer ticker.Stop()
 	for range ticker.C {
 		capacity, used := diskUsage(n.StorageDir)

@@ -30,7 +30,7 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 // La usan los DataNodes para registrarse y enviar heartbeats.
 func (s *Server) withClusterKey(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Cluster-Key") != getenv("CLUSTER_KEY", "dev-cluster-key") {
+		if r.Header.Get("X-Cluster-Key") != s.cfg.ClusterKey {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "cluster key inválida"})
 			return
 		}
