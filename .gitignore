@@ -10,8 +10,15 @@ __pycache__/
 /demo-files/
 *.part
 
+# Auxiliares de LaTeX si se compila un informe a mano (scripts/build-informes.sh no los deja)
+*.aux
+*.log
+*.toc
+*.out
+
 # Entorno local
 .env
 .idea/
 .vscode/
 .DS_Store
+.~lock.*#
