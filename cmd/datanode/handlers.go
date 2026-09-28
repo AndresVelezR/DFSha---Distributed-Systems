@@ -15,8 +15,8 @@ import (
 )
 
 func (n *Node) health(w http.ResponseWriter, r *http.Request) {
-	capacity, used := diskUsage(n.StorageDir)
-	writeJSON(w, http.StatusOK, map[string]any{"node_id": n.ID, "capacity": capacity, "used": used, "n_blocks": countBlocks(n.StorageDir)})
+	blocks, used := storedBlocks(n.StorageDir)
+	writeJSON(w, http.StatusOK, map[string]any{"node_id": n.ID, "capacity": diskCapacity(n.StorageDir), "used": used, "n_blocks": blocks})
 }
 
 // authorized acepta al cliente (token) o a otro nodo del clúster (clave).
