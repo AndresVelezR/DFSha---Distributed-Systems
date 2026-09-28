@@ -1,0 +1,116 @@
+% Formato común de los informes de DFSha, igual al del Hito 1.
+% Todos los hitos usan esta plantilla para que las entregas se vean iguales.
+%
+% Uso mínimo:
+%   \documentclass[10pt]{article}
+%   \usepackage{dfsha-informe}
+%   \hito{2}
+%   \title{DFSha: Título del informe}
+%   \date{28 de septiembre de 2026}
+%   \begin{document}
+%   \portada
+%   ...
+%   \end{document}
+%
+% Se compila con LuaLaTeX: scripts/build-informes.sh
+
+\NeedsTeXFormat{LaTeX2e}
+\ProvidesPackage{dfsha-informe}[2026/09/28 Formato de los informes de DFSha]
+
+% --- Idioma y fuentes ------------------------------------------------------
+\RequirePackage{fontspec}
+\RequirePackage{babel}
+\babelprovide[import,main]{spanish}
+\setmainfont{Latin Modern Roman}
+\setmonofont{DejaVu Sans Mono}[Scale=0.84]
+\addto\captionsspanish{\renewcommand{\contentsname}{Índice general}}
+
+% --- Página ----------------------------------------------------------------
+\RequirePackage[letterpaper,margin=1in,headheight=14pt]{geometry}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{6pt plus 2pt minus 1pt}
+\setcounter{secnumdepth}{0} % el número va escrito en el título, como en el Hito 1
+\setcounter{tocdepth}{2}
+
+% --- Paquetes de contenido -------------------------------------------------
+\RequirePackage{xcolor}
+\RequirePackage{booktabs}
+\RequirePackage{array}
+\RequirePackage{xltabular}
+\RequirePackage{enumitem}
+\RequirePackage{fancyvrb}
+\RequirePackage{framed}
+\RequirePackage{tikz}
+\usetikzlibrary{positioning,arrows.meta,calc,fit}
+\RequirePackage[hidelinks,pdfusetitle]{hyperref}
+\RequirePackage{fancyhdr}
+
+\setlist{itemsep=2pt,topsep=4pt}
+\renewcommand{\arraystretch}{1.25}
+\setlength{\emergencystretch}{2em}
+
+% Columnas de tabla alineadas a la izquierda, sin justificar, como en el Hito 1:
+% L{ancho} para una columna fija y Y para una que ocupa el espacio restante.
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+
+% --- Datos del informe -----------------------------------------------------
+\newcommand{\@hito}{?}
+\newcommand{\hito}[1]{\renewcommand{\@hito}{#1}}
+\author{Andrés Vélez Rendón \and Jose Luis Restrepo}
+
+% --- Cabecera y pie ----------------------------------------------------------
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{DFSha, Hito \@hito}
+\fancyhead[R]{ST0263 / SI3007, 2026-2}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\fancypagestyle{plain}{\fancyhf{}\fancyfoot[C]{\thepage}\renewcommand{\headrulewidth}{0pt}}
+
+% --- Portada: título, subtítulo del curso, autores, fecha e índice ---------
+\newcommand{\portada}{%
+  \let\@tituloinforme\@title
+  \title{\@tituloinforme\\[0.4em]
+    \normalsize Hito \@hito\ | ST0263 Tópicos Especiales en Telemática / SI3007 Sistemas Distribuidos, 2026-2\\| Universidad EAFIT}%
+  \maketitle
+  \thispagestyle{plain}
+  \tableofcontents
+}
+
+% --- Elementos de texto ------------------------------------------------------
+% Línea corta centrada que separa las secciones grandes.
+\newcommand{\separador}{\par\begin{center}\rule{0.5\linewidth}{0.4pt}\end{center}\par}
+
+% Notas: las decisiones se enuncian en el cuerpo con \vernota{N1} y se
+% justifican al final con \nota{N1}{Título}.
+\newcommand{\vernota}[1]{\hyperlink{nota:#1}{\textbf{[#1]}}}
+\newcommand{\nota}[2]{\par\hypertarget{nota:#1}{}\textbf{[#1] #2.}\enspace}
+
+% Rutas de la API: tipografía de código y cortes de línea en las barras.
+\urlstyle{tt}
+\newcommand{\ruta}[1]{\nolinkurl{#1}}
+
+% Diagramas de secuencia: \participante{x}{fin}{texto} dibuja la caja y la
+% línea de vida; \mensaje[estilo]{x origen}{x destino}{y}{texto} una flecha.
+\newcommand{\participante}[3]{%
+  \node[caja, minimum width=2.7cm] at (#1,0) {#3};
+  \draw[vida] (#1,-0.45) -- (#1,#2);}
+\newcommand{\mensaje}[5][flecha]{%
+  \draw[#1] (#2,#4) -- node[above=1pt, font=\footnotesize, align=center, inner sep=1.5pt, fill=white] {#5} (#3,#4);}
+
+% Código y diagramas de texto sobre fondo gris claro.
+\definecolor{shadecolor}{RGB}{246,246,246}
+\newenvironment{codigo}%
+  {\VerbatimEnvironment\begin{snugshade}\begin{Verbatim}[fontsize=\small]}%
+  {\end{Verbatim}\end{snugshade}}
+
+% Estilo común de los diagramas.
+\tikzset{
+  caja/.style={draw, rounded corners=2pt, fill=gray!8, align=center, inner sep=6pt, font=\small},
+  cajaclara/.style={draw, dashed, rounded corners=2pt, align=center, inner sep=6pt, font=\small, text=gray!70!black},
+  flecha/.style={-{Stealth[length=2.2mm]}, thick},
+  flechaclara/.style={-{Stealth[length=2.2mm]}, thick, dashed, gray!70!black},
+  etiqueta/.style={font=\footnotesize, fill=white, inner sep=1.5pt},
+  vida/.style={gray!60, thin, dashed},
+}
