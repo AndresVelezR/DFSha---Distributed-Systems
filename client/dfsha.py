@@ -1,143 +1,230 @@
 #!/usr/bin/env python3
-import argparse, hashlib, json, os, sys, urllib.error, urllib.parse, urllib.request
+"""Cliente CLI de DFSha.
+
+Pide al ControlNode los planes de lectura y escritura, y mueve los bloques
+directamente contra los DataNodes. Nunca tiene direcciones de DataNodes en su
+configuración: las recibe en cada plan.
+"""
+import argparse
+import hashlib
+import json
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 TOKEN_FILE = os.path.expanduser("~/.dfsha_token")
+DEFAULT_CONTROL_URL = "http://localhost:8000"
+DEFAULT_WORKERS = 4
+BLOCK_TIMEOUT_SECONDS = 300
 
-class DFSClient:
-    def __init__(self, control):
-        self.control = control.rstrip("/")
-        self.token = os.environ.get("DFSHA_TOKEN") or self._read_token()
 
-    def _read_token(self):
+class DfshaHttpError(RuntimeError):
+    """El servidor respondió con un código de error HTTP."""
+
+    def __init__(self, status, body):
+        super().__init__(f"HTTP {status}: {body}")
+        self.status = status
+
+
+class DfshaClient:
+    def __init__(self, control_url):
+        self.control_url = control_url.rstrip("/")
+        self.token = os.environ.get("DFSHA_TOKEN") or self._read_saved_token()
+
+    # --- transporte HTTP -------------------------------------------------
+
+    @staticmethod
+    def _read_saved_token():
         try:
-            return open(TOKEN_FILE, "r", encoding="utf-8").read().strip()
+            with open(TOKEN_FILE, encoding="utf-8") as f:
+                return f.read().strip()
         except OSError:
             return ""
 
-    def request(self, method, url, data=None, json_body=None, headers=None, timeout=120):
-        h = dict(headers or {})
+    def _request(self, method, url, data=None, json_body=None, headers=None, timeout=120):
+        headers = dict(headers or {})
         if self.token:
-            h.setdefault("Authorization", "Bearer " + self.token)
+            headers.setdefault("Authorization", "Bearer " + self.token)
         if json_body is not None:
             data = json.dumps(json_body).encode()
-            h["Content-Type"] = "application/json"
-        req = urllib.request.Request(url, data=data, method=method, headers=h)
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url, data=data, method=method, headers=headers)
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                body = r.read()
-                ctype = r.headers.get("Content-Type", "")
-                if "application/json" in ctype:
-                    return r.status, json.loads(body or b"{}")
-                return r.status, body
-        except urllib.error.HTTPError as e:
-            body = e.read().decode(errors="replace")
-            raise RuntimeError(f"HTTP {e.code}: {body}") from e
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                body = response.read()
+                if "application/json" in response.headers.get("Content-Type", ""):
+                    return json.loads(body or b"{}")
+                return body
+        except urllib.error.HTTPError as error:
+            raise DfshaHttpError(error.code, error.read().decode(errors="replace")) from error
 
-    def login(self, user, password):
-        _, obj = self.request("POST", self.control + "/auth/login", json_body={"username":user,"password":password})
-        self.token = obj["token"]
-        with open(TOKEN_FILE, "w", encoding="utf-8") as f: f.write(self.token)
+    def _control(self, method, endpoint, query=None, json_body=None):
+        url = self.control_url + endpoint
+        if query:
+            url += "?" + urllib.parse.urlencode(query)
+        return self._request(method, url, json_body=json_body)
+
+    @staticmethod
+    def _block_url(node, block_id):
+        return f"http://{node['host']}:{node['port']}/blocks/{block_id}"
+
+    # --- RF1: gestión del sistema de archivos ----------------------------
+
+    def login(self, username, password):
+        response = self._control("POST", "/auth/login", json_body={"username": username, "password": password})
+        self.token = response["token"]
+        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
+            f.write(self.token)
         print("Autenticación correcta; token guardado en", TOKEN_FILE)
 
-    def mkdir(self, p):
-        _, o = self.request("POST", self.control+"/fs/mkdir", json_body={"path":p}); print(json.dumps(o,indent=2))
-    def ls(self, p):
-        _, o = self.request("GET", self.control+"/fs/ls?"+urllib.parse.urlencode({"path":p})); print(json.dumps(o,indent=2))
-    def stat(self, p):
-        _, o = self.request("GET", self.control+"/fs/stat?"+urllib.parse.urlencode({"path":p})); print(json.dumps(o,indent=2))
-    def rm(self, p):
-        self.request("DELETE", self.control+"/fs/rm?"+urllib.parse.urlencode({"path":p})); print("Borrado de metadatos:",p)
-    def rmdir(self, p):
-        self.request("DELETE", self.control+"/fs/rmdir?"+urllib.parse.urlencode({"path":p})); print("Directorio borrado:",p)
+    def ls(self, path):
+        print_json(self._control("GET", "/fs/ls", query={"path": path}))
+
+    def mkdir(self, path):
+        print_json(self._control("POST", "/fs/mkdir", json_body={"path": path}))
+
+    def rmdir(self, path):
+        self._control("DELETE", "/fs/rmdir", query={"path": path})
+        print("Directorio borrado:", path)
+
+    def rm(self, path):
+        self._control("DELETE", "/fs/rm", query={"path": path})
+        print("Borrado de metadatos:", path)
+
     def mv(self, src, dst):
-        _,o=self.request("POST",self.control+"/fs/mv",json_body={"src":src,"dst":dst});print(json.dumps(o,indent=2))
+        print_json(self._control("POST", "/fs/mv", json_body={"src": src, "dst": dst}))
 
-    def put(self, local, remote, workers=4):
-        size=os.path.getsize(local)
-        _,plan=self.request("POST",self.control+"/files/upload/plan",json_body={"path":remote,"size":size})
-        bs=plan["block_size"]
-        print(f"Plan: {plan['n_blocks']} bloques de hasta {bs} bytes")
+    def stat(self, path):
+        print_json(self._control("GET", "/fs/stat", query={"path": path}))
 
-        jobs=[]
-        with open(local,"rb") as f:
-            for bp in plan["blocks"]:
-                data=f.read(bs)
-                jobs.append((bp,data))
+    # --- RF2: transferencia de archivos -----------------------------------
 
-        def upload(job):
-            bp,data=job
-            block_id=hashlib.sha256(data).hexdigest()
-            targets=bp["targets"]
-            first=targets[0]
-            url=f"http://{first['host']}:{first['port']}/blocks/{block_id}"
-            headers={"Content-Type":"application/octet-stream"}
-            if len(targets)>1:
-                forwards=[]
-                for i,t in enumerate(targets[1:], start=1):
-                    forwards.append(f"http://{t['host']}:{t['port']}")
-                    headers[f"X-Forward-Node-{i}"]=t["node"]
-                headers["X-Forward-To"]=",".join(forwards)
-            _,resp=self.request("PUT",url,data=data,headers=headers,timeout=300)
-            stored=resp.get("stored_on",[t["node"] for t in targets])
-            return {"index":bp["index"],"block_id":block_id,"size":len(data),"stored_on":stored}
+    def put(self, local_path, remote_path, workers=DEFAULT_WORKERS):
+        size = os.path.getsize(local_path)
+        plan = self._control("POST", "/files/upload/plan", json_body={"path": remote_path, "size": size})
+        block_size = plan["block_size"]
+        print(f"Plan: {plan['n_blocks']} bloques de hasta {block_size} bytes")
 
-        results=[]
+        jobs = []
+        with open(local_path, "rb") as f:
+            for block_plan in plan["blocks"]:
+                jobs.append((block_plan, f.read(block_size)))
+
+        stored_blocks = []
         try:
-            with ThreadPoolExecutor(max_workers=workers) as ex:
-                futs=[ex.submit(upload,j) for j in jobs]
-                for fut in as_completed(futs):
-                    b=fut.result();results.append(b);print(f"  bloque {b['index']} -> {', '.join(b['stored_on'])}")
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(self._upload_block, *job) for job in jobs]
+                for future in as_completed(futures):
+                    block = future.result()
+                    stored_blocks.append(block)
+                    print(f"  bloque {block['index']} -> {', '.join(block['stored_on'])}")
         except Exception:
-            try:self.request("POST",self.control+"/files/upload/abort",json_body={"upload_id":plan["upload_id"]})
-            finally:raise
-        results.sort(key=lambda x:x["index"])
-        _,commit=self.request("POST",self.control+"/files/upload/commit",json_body={"upload_id":plan["upload_id"],"blocks":results})
-        print(json.dumps(commit,indent=2))
+            try:
+                self._control("POST", "/files/upload/abort", json_body={"upload_id": plan["upload_id"]})
+            finally:
+                raise
 
-    def get(self, remote, local, workers=4):
-        _,plan=self.request("GET",self.control+"/files/download/plan?"+urllib.parse.urlencode({"path":remote}))
-        def fetch(b):
-            last=None
-            for r in b["replicas"]:
-                url=f"http://{r['host']}:{r['port']}/blocks/{b['block_id']}"
-                try:
-                    _,data=self.request("GET",url,timeout=300)
-                    if hashlib.sha256(data).hexdigest()!=b["block_id"]: raise RuntimeError("hash inválido")
-                    return b["index"],data,r["node"]
-                except Exception as e:last=e
-            raise last or RuntimeError("sin réplicas")
-        chunks={}
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futs=[ex.submit(fetch,b) for b in plan["blocks"]]
-            for fut in as_completed(futs):
-                idx,data,node=fut.result();chunks[idx]=data;print(f"  bloque {idx} <- {node}")
-        with open(local,"wb") as f:
-            for i in range(len(plan["blocks"])):f.write(chunks[i])
-        print(f"Archivo reconstruido en {local} ({os.path.getsize(local)} bytes)")
+        stored_blocks.sort(key=lambda block: block["index"])
+        commit = self._control("POST", "/files/upload/commit", json_body={"upload_id": plan["upload_id"], "blocks": stored_blocks})
+        print_json(commit)
+
+    def _upload_block(self, block_plan, data):
+        """Sube el bloque al primer destino, que lo propaga a los demás."""
+        block_id = hashlib.sha256(data).hexdigest()
+        first, *others = block_plan["targets"]
+        headers = {"Content-Type": "application/octet-stream"}
+        if others:
+            headers["X-Forward-To"] = ",".join(f"http://{t['host']}:{t['port']}" for t in others)
+            for position, target in enumerate(others, start=1):
+                headers[f"X-Forward-Node-{position}"] = target["node"]
+        response = self._request("PUT", self._block_url(first, block_id), data=data, headers=headers, timeout=BLOCK_TIMEOUT_SECONDS)
+        stored_on = response.get("stored_on", [t["node"] for t in block_plan["targets"]])
+        return {"index": block_plan["index"], "block_id": block_id, "size": len(data), "stored_on": stored_on}
+
+    def get(self, remote_path, local_path, workers=DEFAULT_WORKERS):
+        plan = self._control("GET", "/files/download/plan", query={"path": remote_path})
+        chunks = {}
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [pool.submit(self._download_block, block) for block in plan["blocks"]]
+            for future in as_completed(futures):
+                index, data, node = future.result()
+                chunks[index] = data
+                print(f"  bloque {index} <- {node}")
+        with open(local_path, "wb") as f:
+            for index in range(len(plan["blocks"])):
+                f.write(chunks[index])
+        print(f"Archivo reconstruido en {local_path} ({os.path.getsize(local_path)} bytes)")
+
+    def _download_block(self, block):
+        """Descarga el bloque de la primera réplica que responda con la firma correcta."""
+        last_error = None
+        for replica in block["replicas"]:
+            try:
+                data = self._request("GET", self._block_url(replica, block["block_id"]), timeout=BLOCK_TIMEOUT_SECONDS)
+                if hashlib.sha256(data).hexdigest() != block["block_id"]:
+                    raise RuntimeError("hash inválido")
+                return block["index"], data, replica["node"]
+            except Exception as error:
+                last_error = error
+        raise last_error or RuntimeError("sin réplicas")
+
+
+def print_json(value):
+    print(json.dumps(value, indent=2, ensure_ascii=False))
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(description="Cliente CLI de DFSha")
+    parser.add_argument("--control", default=os.environ.get("DFSHA_CONTROL", DEFAULT_CONTROL_URL))
+    commands = parser.add_subparsers(dest="cmd", required=True)
+
+    login = commands.add_parser("login")
+    login.add_argument("username")
+    login.add_argument("password")
+
+    commands.add_parser("ls").add_argument("path", nargs="?", default="/")
+    commands.add_parser("mkdir").add_argument("path")
+    commands.add_parser("rmdir").add_argument("path")
+    commands.add_parser("rm").add_argument("path")
+    commands.add_parser("stat").add_argument("path")
+
+    mv = commands.add_parser("mv")
+    mv.add_argument("src")
+    mv.add_argument("dst")
+
+    put = commands.add_parser("put")
+    put.add_argument("local")
+    put.add_argument("remote")
+    put.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+
+    get = commands.add_parser("get")
+    get.add_argument("remote")
+    get.add_argument("local")
+    get.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
+    return parser
+
 
 def main():
-    p=argparse.ArgumentParser(description="Cliente CLI de DFSha Hito 2")
-    p.add_argument("--control",default=os.environ.get("DFSHA_CONTROL","http://localhost:8000"))
-    sub=p.add_subparsers(dest="cmd",required=True)
-    a=sub.add_parser("login");a.add_argument("username");a.add_argument("password")
-    a=sub.add_parser("ls");a.add_argument("path",nargs="?",default="/")
-    a=sub.add_parser("mkdir");a.add_argument("path")
-    a=sub.add_parser("stat");a.add_argument("path")
-    a=sub.add_parser("rm");a.add_argument("path")
-    a=sub.add_parser("rmdir");a.add_argument("path")
-    a=sub.add_parser("mv");a.add_argument("src");a.add_argument("dst")
-    a=sub.add_parser("put");a.add_argument("local");a.add_argument("remote");a.add_argument("--workers",type=int,default=4)
-    a=sub.add_parser("get");a.add_argument("remote");a.add_argument("local");a.add_argument("--workers",type=int,default=4)
-    args=p.parse_args();c=DFSClient(args.control)
-    if args.cmd=="login":c.login(args.username,args.password)
-    elif not c.token:sys.exit("Primero ejecuta: dfsha.py login demo demo")
-    elif args.cmd=="ls":c.ls(args.path)
-    elif args.cmd=="mkdir":c.mkdir(args.path)
-    elif args.cmd=="stat":c.stat(args.path)
-    elif args.cmd=="rm":c.rm(args.path)
-    elif args.cmd=="rmdir":c.rmdir(args.path)
-    elif args.cmd=="mv":c.mv(args.src,args.dst)
-    elif args.cmd=="put":c.put(args.local,args.remote,args.workers)
-    elif args.cmd=="get":c.get(args.remote,args.local,args.workers)
-if __name__=="__main__":main()
+    args = build_parser().parse_args()
+    client = DfshaClient(args.control)
+    if args.cmd == "login":
+        client.login(args.username, args.password)
+        return
+    if not client.token:
+        sys.exit("Primero ejecuta: dfsha.py login demo demo")
+
+    if args.cmd in ("ls", "mkdir", "rmdir", "rm", "stat"):
+        getattr(client, args.cmd)(args.path)
+    elif args.cmd == "mv":
+        client.mv(args.src, args.dst)
+    elif args.cmd == "put":
+        client.put(args.local, args.remote, args.workers)
+    elif args.cmd == "get":
+        client.get(args.remote, args.local, args.workers)
+
+
+if __name__ == "__main__":
+    main()
