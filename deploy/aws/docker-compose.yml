@@ -1,0 +1,45 @@
+# Despliegue de DFSha en varias máquinas (AWS Academy, Hito 1 sección 5).
+# Todas las VMs usan este mismo archivo; lo que cambia es su .env
+# (ver .env.example). Desde deploy/aws/ en cada VM:
+#   docker compose up -d --build
+
+x-parameters: &parameters
+  CLUSTER_KEY: ${CLUSTER_KEY:?define CLUSTER_KEY en .env}
+  HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-3}
+
+services:
+  controlnode:
+    profiles: [controlnode]
+    build:
+      context: ../..
+      dockerfile: docker/controlnode.Dockerfile
+    environment:
+      <<: *parameters
+      NODE_ID: ${CONTROLNODE_ID:-cn-01}
+      REPLICATION_FACTOR: ${REPLICATION_FACTOR:-2}
+      BLOCK_SIZE_MIN_MB: ${BLOCK_SIZE_MIN_MB:-8}
+      BLOCK_SIZE_MAX_MB: ${BLOCK_SIZE_MAX_MB:-64}
+      BLOCKS_PER_NODE: ${BLOCKS_PER_NODE:-4}
+      HEARTBEAT_MISSES: ${HEARTBEAT_MISSES:-3}
+      WRITE_LEASE_TTL_SECONDS: ${WRITE_LEASE_TTL_SECONDS:-60}
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  datanode:
+    profiles: [datanode]
+    build:
+      context: ../..
+      dockerfile: docker/datanode.Dockerfile
+    environment:
+      <<: *parameters
+      NODE_ID: ${DATANODE_ID:?define DATANODE_ID en .env}
+      ADVERTISE_HOST: ${ADVERTISE_HOST:?define ADVERTISE_HOST en .env}
+      PORT: ${DATANODE_PORT:-8001}
+      CONTROL_URL: http://${CONTROLNODE_HOST:?define CONTROLNODE_HOST en .env}:8000
+      STORAGE_DIR: /data
+    ports:
+      - "${DATANODE_PORT:-8001}:${DATANODE_PORT:-8001}"
+    volumes:
+      - ${BLOCKS_DIR:-/srv/dfsha/blocks}:/data
+    restart: unless-stopped
