@@ -133,15 +133,10 @@ class DfshaClient:
         block_size = plan["block_size"]
         print(f"Plan: {plan['n_blocks']} bloques de hasta {block_size} bytes")
 
-        jobs = []
-        with open(local_path, "rb") as f:
-            for block_plan in plan["blocks"]:
-                jobs.append((block_plan, f.read(block_size)))
-
         stored_blocks = []
         try:
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = [pool.submit(self._upload_block, *job) for job in jobs]
+                futures = [pool.submit(self._upload_block, local_path, block_size, block_plan) for block_plan in plan["blocks"]]
                 for future in as_completed(futures):
                     block = future.result()
                     stored_blocks.append(block)
@@ -154,14 +149,18 @@ class DfshaClient:
 
         stored_blocks.sort(key=lambda block: block["index"])
         # TODO Hito 3: si el commit responde 410 (reserva vencida), pedir un plan nuevo.
-        commit =self._control("POST", "/files/upload/commit", json_body={"upload_id": plan["upload_id"], "blocks": stored_blocks})
+        commit = self._control("POST", "/files/upload/commit", json_body={"upload_id": plan["upload_id"], "blocks": stored_blocks})
         print_json(commit)
 
-    def _upload_block(self, block_plan, data):
-        """Sube el bloque al primer destino, que lo propaga a los demás.
+    def _upload_block(self, local_path, block_size, block_plan):
+        """Lee su bloque del archivo local y lo sube al primer destino, que lo
+        propaga a los demás.
 
+        Cada worker lee solo su bloque, así que en memoria nunca hay más de
+        workers x block_size bytes, sin importar el tamaño del archivo.
         Ante un fallo de red reintenta contra el mismo destino (ver with_network_retries).
         """
+        data = read_block(local_path, block_plan["index"], block_size)
         block_id = hashlib.sha256(data).hexdigest()
         first, *others = block_plan["targets"]
         headers = {"Content-Type": "application/octet-stream"}
@@ -177,18 +176,32 @@ class DfshaClient:
         return {"index": block_plan["index"], "block_id": block_id, "size": len(data), "stored_on": stored_on}
 
     def get(self, remote_path, local_path, workers=DEFAULT_WORKERS):
+        """Descarga los bloques en paralelo y escribe cada uno en su posición.
+
+        Se escribe sobre un archivo .part que solo se renombra al nombre final
+        cuando todos los bloques llegaron y pasaron la verificación de firma.
+        """
         plan = self._control("GET", "/files/download/plan", query={"path": remote_path})
-        chunks = {}
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(self._download_block, block) for block in plan["blocks"]]
-            for future in as_completed(futures):
-                index, data, node = future.result()
-                chunks[index] = data
-                print(f"  bloque {index} <- {node}")
-        with open(local_path, "wb") as f:
-            for index in range(len(plan["blocks"])):
-                f.write(chunks[index])
+        partial_path = local_path + ".part"
+        with open(partial_path, "wb") as f:
+            f.truncate(plan["size"])
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(self._download_block_into, partial_path, plan["block_size"], block) for block in plan["blocks"]]
+                for future in as_completed(futures):
+                    index, node = future.result()
+                    print(f"  bloque {index} <- {node}")
+        except Exception:
+            os.remove(partial_path)
+            raise
+        os.replace(partial_path, local_path)
         print(f"Archivo reconstruido en {local_path} ({os.path.getsize(local_path)} bytes)")
+
+    def _download_block_into(self, partial_path, block_size, block):
+        """Descarga un bloque y lo escribe en su posición dentro de partial_path."""
+        index, data, node = self._download_block(block)
+        write_block(partial_path, index, block_size, data)
+        return index, node
 
     def _download_block(self, block):
         """Descarga el bloque de la primera réplica que responda con la firma correcta.
@@ -206,6 +219,20 @@ class DfshaClient:
             except Exception as error:
                 last_error = error
         raise last_error or RuntimeError("sin réplicas")
+
+
+def read_block(path, index, block_size):
+    """Lee el bloque número index (desde 0) de un archivo local."""
+    with open(path, "rb") as f:
+        f.seek(index * block_size)
+        return f.read(block_size)
+
+
+def write_block(path, index, block_size, data):
+    """Escribe data como el bloque número index de un archivo ya creado."""
+    with open(path, "r+b") as f:
+        f.seek(index * block_size)
+        f.write(data)
 
 
 def print_json(value):
