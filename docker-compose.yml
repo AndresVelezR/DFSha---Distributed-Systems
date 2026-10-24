@@ -1,109 +1,155 @@
-# Clúster local de DFSha: 1 ControlNode y 3 DataNodes en una red privada.
-# Los parámetros operativos se pueden cambiar sin recompilar, por ejemplo:
-#   REPLICATION_FACTOR=1 docker compose up -d
-# o dejándolos en un archivo .env junto a este archivo.
+# Docker Compose local: tres votos Raft independientes y tres DataNodes.
+# Inicializar: python scripts/setup.py ; docker compose up -d --build
+x-security-env: &security-env
+  TLS_CERT: /secrets/cluster.crt
+  TLS_KEY: /secrets/cluster.key
+  TLS_CA: /secrets/ca.crt
+  CLUSTER_KEY_FILE: /secrets/cluster-key
+  SIGNING_KEY_FILE: /secrets/signing-key
+  ENCRYPTION_KEY_FILE: /secrets/encryption-key
 
-x-cluster-env: &cluster-env
-  CLUSTER_KEY: dev-cluster-key
-  HEARTBEAT_INTERVAL_SECONDS: ${HEARTBEAT_INTERVAL_SECONDS:-3}
+x-control-env: &control-env
+  <<: *security-env
+  CN_ADDR: :8000
+  RAFT_ADDR: :9000
+  METADATA_DIR: /metadata
+  USERS_FILE: /secrets/users.json
+  CN_PEERS: cn-01@cn1:9000@https://cn1:8000,cn-02@cn2:9000@https://cn2:8000,cn-03@cn3:9000@https://cn3:8000
+  REPLICATION_FACTOR: ${REPLICATION_FACTOR:-2}
+  BLOCK_SIZE_MIN_MB: ${BLOCK_SIZE_MIN_MB:-8}
+  BLOCK_SIZE_MAX_MB: ${BLOCK_SIZE_MAX_MB:-64}
+  BLOCKS_PER_NODE: ${BLOCKS_PER_NODE:-4}
+  HEARTBEAT_MS: ${HEARTBEAT_MS:-3000}
+  HEARTBEAT_MISSES: ${HEARTBEAT_MISSES:-3}
+  WRITE_LEASE_SECONDS: ${WRITE_LEASE_SECONDS:-60}
+  MAINTENANCE_MS: ${MAINTENANCE_MS:-5000}
+  GC_GRACE_SECONDS: ${GC_GRACE_SECONDS:-120}
+  FULL_THRESHOLD_PERCENT: ${FULL_THRESHOLD_PERCENT:-90}
+  REBALANCE_THRESHOLD_PERCENT: ${REBALANCE_THRESHOLD_PERCENT:-10}
 
-# Todos los DataNodes usan la misma imagen, construida una sola vez.
-x-datanode: &datanode
-  image: dfsha-datanode
+x-control: &control
+  image: dfsha-controlnode:local
+  build:
+    context: .
+    dockerfile: docker/controlnode.Dockerfile
+  restart: unless-stopped
+  networks: [dfsha]
+  healthcheck:
+    test: [CMD, wget, -q, -O, /dev/null, --ca-certificate=/secrets/ca.crt, https://localhost:8000/health]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 10s
+
+x-data-env: &data-env
+  <<: *security-env
+  DN_ADDR: :8001
+  CONTROL_URLS: https://cn1:8000,https://cn2:8000,https://cn3:8000
+  STORAGE_DIR: /data
+  CAPACITY_BYTES: ${CAPACITY_BYTES:-1073741824}
+  HEARTBEAT_MS: ${HEARTBEAT_MS:-3000}
+  REPORT_MS: ${REPORT_MS:-30000}
+
+x-data: &data
+  image: dfsha-datanode:local
   build:
     context: .
     dockerfile: docker/datanode.Dockerfile
-  depends_on: [controlnode]
+  restart: unless-stopped
   networks: [dfsha]
+  depends_on:
+    cn1: {condition: service_started}
+    cn2: {condition: service_started}
+    cn3: {condition: service_started}
+  healthcheck:
+    test: [CMD, wget, -q, -O, /dev/null, --ca-certificate=/secrets/ca.crt, https://localhost:8001/health]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+    start_period: 10s
 
 services:
-  controlnode:
-    image: dfsha-controlnode
-    build:
-      context: .
-      dockerfile: docker/controlnode.Dockerfile
+  cn1:
+    <<: *control
     environment:
-      <<: *cluster-env
+      <<: *control-env
       NODE_ID: cn-01
-      REPLICATION_FACTOR: ${REPLICATION_FACTOR:-2}
-      BLOCK_SIZE_MIN_MB: ${BLOCK_SIZE_MIN_MB:-8}
-      BLOCK_SIZE_MAX_MB: ${BLOCK_SIZE_MAX_MB:-64}
-      BLOCKS_PER_NODE: ${BLOCKS_PER_NODE:-4}
-      HEARTBEAT_MISSES: ${HEARTBEAT_MISSES:-3}
-      WRITE_LEASE_TTL_SECONDS: ${WRITE_LEASE_TTL_SECONDS:-60}
-    ports:
-      - "8000:8000"
-    networks: [dfsha]
-
+      RAFT_ADVERTISE: cn1:9000
+    ports: ["127.0.0.1:8000:8000"]
+    volumes: ["./.secrets:/secrets:ro", "cn1:/metadata"]
+  cn2:
+    <<: *control
+    environment:
+      <<: *control-env
+      NODE_ID: cn-02
+      RAFT_ADVERTISE: cn2:9000
+    ports: ["127.0.0.1:8010:8000"]
+    volumes: ["./.secrets:/secrets:ro", "cn2:/metadata"]
+  cn3:
+    <<: *control
+    environment:
+      <<: *control-env
+      NODE_ID: cn-03
+      RAFT_ADVERTISE: cn3:9000
+    ports: ["127.0.0.1:8020:8000"]
+    volumes: ["./.secrets:/secrets:ro", "cn3:/metadata"]
   dn1:
-    <<: *datanode
+    <<: *data
     environment:
-      <<: *cluster-env
+      <<: *data-env
       NODE_ID: dn-01
-      ADVERTISE_HOST: dn1
-      PORT: 8001
-      CONTROL_URL: http://controlnode:8000
-      STORAGE_DIR: /data
-    volumes: [dn1:/data]
-
+      ADVERTISE_URL: https://dn1:8001
+    ports: ["127.0.0.1:8001:8001"]
+    volumes: ["./.secrets:/secrets:ro", "dn1:/data"]
   dn2:
-    <<: *datanode
+    <<: *data
     environment:
-      <<: *cluster-env
+      <<: *data-env
       NODE_ID: dn-02
-      ADVERTISE_HOST: dn2
-      PORT: 8001
-      CONTROL_URL: http://controlnode:8000
-      STORAGE_DIR: /data
-    volumes: [dn2:/data]
-
+      ADVERTISE_URL: https://dn2:8001
+    ports: ["127.0.0.1:8011:8001"]
+    volumes: ["./.secrets:/secrets:ro", "dn2:/data"]
   dn3:
-    <<: *datanode
+    <<: *data
     environment:
-      <<: *cluster-env
+      <<: *data-env
       NODE_ID: dn-03
-      ADVERTISE_HOST: dn3
-      PORT: 8001
-      CONTROL_URL: http://controlnode:8000
-      STORAGE_DIR: /data
-    volumes: [dn3:/data]
-
-  # Cuarto DataNode, apagado por defecto. Sirve para demostrar que un nodo se
-  # agrega con el clúster en marcha, sin reiniciar ni reconfigurar nada
-  # (Hito 1, vm-04): docker compose --profile scale up -d dn4
+      ADVERTISE_URL: https://dn3:8001
+    ports: ["127.0.0.1:8021:8001"]
+    volumes: ["./.secrets:/secrets:ro", "dn3:/data"]
   dn4:
-    <<: *datanode
+    <<: *data
     profiles: [scale]
     environment:
-      <<: *cluster-env
+      <<: *data-env
       NODE_ID: dn-04
-      ADVERTISE_HOST: dn4
-      PORT: 8001
-      CONTROL_URL: http://controlnode:8000
-      STORAGE_DIR: /data
-    volumes: [dn4:/data]
-
-  # Herramienta de línea de comandos, no un servicio: se usa con
-  # "docker compose run --rm client <comando>" con el clúster ya levantado.
-  # No declara depends_on para no volver a encender un DataNode que se
-  # detuvo a propósito (por ejemplo, en la prueba de tolerancia a fallos).
+      ADVERTISE_URL: https://dn4:8001
+    ports: ["127.0.0.1:8031:8001"]
+    volumes: ["./.secrets:/secrets:ro", "dn4:/data"]
   client:
-    image: dfsha-client
-    pull_policy: build # se construye siempre desde el código, nunca queda desactualizado
+    image: dfsha-client:local
     build:
       context: .
       dockerfile: docker/client.Dockerfile
-    environment:
-      DFSHA_CONTROL: http://controlnode:8000
-      HOME: /tmp
-    networks: [dfsha]
     profiles: [tools]
+    working_dir: /work
+    environment:
+      DFSHA_CONTROLS: https://cn1:8000,https://cn2:8000,https://cn3:8000
+      DFSHA_CA: /secrets/ca.crt
+      DFSHA_SESSION: /session/session.json
+    # Sin depends_on: una lectura durante una falla no vuelve a encender nodos.
+    volumes: ["./:/work", "./.secrets:/secrets:ro", "client-session:/session"]
+    networks: [dfsha]
 
 volumes:
+  cn1:
+  cn2:
+  cn3:
   dn1:
   dn2:
   dn3:
   dn4:
+  client-session:
 
 networks:
   dfsha:

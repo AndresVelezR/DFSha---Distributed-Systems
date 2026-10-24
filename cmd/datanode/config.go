@@ -1,54 +1,63 @@
 package main
 
 import (
-	"fmt"
-	"os"
+	"errors"
+	"net/url"
 	"strconv"
+	"strings"
 	"time"
+
+	"dfsha/internal/common"
 )
 
-// loadNode arma la configuración del DataNode desde variables de entorno.
-// Los valores por defecto sirven para correrlo local junto a un ControlNode
-// en localhost:8000.
 func loadNode() (*Node, error) {
-	port, err := getenvInt("PORT", 8001)
+	cfg, err := common.LoadConfig()
 	if err != nil {
 		return nil, err
 	}
-	heartbeatSeconds, err := getenvInt("HEARTBEAT_INTERVAL_SECONDS", 3)
-	if err != nil {
-		return nil, err
+	capacity, err := strconv.ParseInt(common.Env("CAPACITY_BYTES", "1073741824"), 10, 64)
+	if err != nil || capacity < maxBlockSize {
+		return nil, errors.New("CAPACITY_BYTES debe ser un entero >= 67108864")
 	}
-	if heartbeatSeconds < 1 {
-		return nil, fmt.Errorf("HEARTBEAT_INTERVAL_SECONDS debe ser al menos 1")
+	scheme := "https"
+	if cfg.Insecure {
+		scheme = "http"
 	}
-	return &Node{
-		ID:                getenv("NODE_ID", "dn-01"),
-		Host:              getenv("ADVERTISE_HOST", "localhost"),
-		Port:              port,
-		ControlURL:        getenv("CONTROL_URL", "http://localhost:8000"),
-		StorageDir:        getenv("STORAGE_DIR", "./data"),
-		ClusterKey:        getenv("CLUSTER_KEY", "dev-cluster-key"),
-		ClientToken:       getenv("CLIENT_TOKEN", "dfsha-dev-token"),
-		HeartbeatInterval: time.Duration(heartbeatSeconds) * time.Second,
-	}, nil
+	n := &Node{
+		ID:         common.Env("NODE_ID", "dn-01"),
+		URL:        common.Env("ADVERTISE_URL", scheme+"://localhost:8001"),
+		Addr:       common.Env("DN_ADDR", ":8001"),
+		StorageDir: common.Env("STORAGE_DIR", "/data"),
+		Capacity:   capacity, Config: cfg, Client: common.HTTPClient(cfg),
+	}
+	for _, raw := range strings.Split(common.Env("CONTROL_URLS", scheme+"://localhost:8000"), ",") {
+		base := strings.TrimRight(strings.TrimSpace(raw), "/")
+		if err := n.validURL(base); err != nil {
+			return nil, err
+		}
+		n.ControlURLs = append(n.ControlURLs, base)
+	}
+	if n.ID == "" || n.validURL(n.URL) != nil {
+		return nil, errors.New("NODE_ID y ADVERTISE_URL válidos requeridos")
+	}
+	return n, nil
 }
 
-func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+func (n *Node) validURL(base string) error {
+	u, err := url.Parse(base)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
+		return errors.New("URL de nodo no válida")
 	}
-	return def
+	if u.Scheme != "https" && !(n.Config.Insecure && u.Scheme == "http") {
+		return errors.New("la URL requiere HTTPS (HTTP sólo con DFSHA_INSECURE=true)")
+	}
+	return nil
 }
 
-func getenvInt(key string, def int) (int, error) {
-	raw := os.Getenv(key)
-	if raw == "" {
-		return def, nil
+func interval(name string, fallback time.Duration) time.Duration {
+	v, err := strconv.ParseInt(common.Env(name, "0"), 10, 64)
+	if err == nil && v > 0 {
+		return time.Duration(v) * time.Millisecond
 	}
-	v, err := strconv.Atoi(raw)
-	if err != nil {
-		return def, fmt.Errorf("%s=%q no es un entero", key, raw)
-	}
-	return v, nil
+	return fallback
 }

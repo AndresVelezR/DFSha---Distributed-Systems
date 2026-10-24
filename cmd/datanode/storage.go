@@ -1,55 +1,181 @@
 package main
 
 import (
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"errors"
+	"io"
+	"log"
 	"os"
-	"strings"
-	"syscall"
+	"path/filepath"
 )
 
-// Acceso al disco local donde viven los bloques.
+var blockMagic = []byte("DFSHA1\x00")
+var errCapacity = errors.New("capacidad insuficiente")
 
-// usage es lo que el DataNode reporta al ControlNode: la capacidad del volumen
-// y los bytes que ocupan sus bloques. La ocupación se mide por bloques y no
-// por el espacio usado del disco, porque cuando varios DataNodes comparten un
-// disco (Docker en una sola máquina) este refleja todo lo que hay en la
-// máquina y no la carga del nodo. En un volumen dedicado a bloques, como el
-// del Hito 1, ambas medidas coinciden.
-func usage(dir string) (capacity, used int64) {
-	_, used = storedBlocks(dir)
-	return diskCapacity(dir), used
-}
-
-// diskCapacity devuelve el tamaño total del volumen donde está dir, en bytes.
-func diskCapacity(dir string) int64 {
-	var st syscall.Statfs_t
-	if err := syscall.Statfs(dir, &st); err != nil {
-		return 0
+func validID(id string) bool {
+	if len(id) != sha256.Size*2 {
+		return false
 	}
-	return int64(st.Blocks) * int64(st.Bsize)
-}
-
-// storedBlocks cuenta los bloques completos guardados en dir y los bytes que
-// ocupan. Ignora los .tmp de escrituras en curso.
-func storedBlocks(dir string) (count int, bytes int64) {
-	entries, _ := os.ReadDir(dir)
-	for _, e := range entries {
-		if e.IsDir() || strings.HasSuffix(e.Name(), ".tmp") {
-			continue
+	for _, c := range id {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
 		}
-		info, err := e.Info()
-		if err != nil {
-			continue
-		}
-		count++
-		bytes += info.Size()
 	}
-	return count, bytes
+	return true
 }
 
-func fileSize(p string) int64 {
-	st, err := os.Stat(p)
+func hashID(b []byte) string {
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:])
+}
+
+// El mutex protege publicación, lectura e inventario; nunca se conserva
+// durante transferencias de red. Cada escritura obtiene un temporal único.
+func (n *Node) store(id string, plain []byte) (bool, error) {
+	n.storageMu.Lock()
+	defer n.storageMu.Unlock()
+	p := filepath.Join(n.StorageDir, id)
+	if existing, err := n.readBlockLocked(id); err == nil {
+		if !bytes.Equal(existing, plain) {
+			return false, errors.New("conflicto con bloque inmutable")
+		}
+		return false, nil
+	} else if !os.IsNotExist(err) {
+		log.Printf("reparando copia corrupta %s: %v", id, err)
+	}
+	_, used := n.inventoryLocked()
+	if int64(len(plain)) > n.Capacity-used {
+		return false, errCapacity
+	}
+	sealed, err := n.encrypt(id, plain)
 	if err != nil {
-		return 0
+		return false, err
 	}
-	return st.Size()
+	tmp, err := os.CreateTemp(n.StorageDir, ".block-*")
+	if err != nil {
+		return false, err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0600); err != nil {
+		_ = tmp.Close()
+		return false, err
+	}
+	_, writeErr := tmp.Write(sealed)
+	if writeErr == nil {
+		writeErr = tmp.Sync()
+	}
+	closeErr := tmp.Close()
+	if writeErr != nil {
+		return false, writeErr
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	// Windows no permite renombrar sobre un archivo existente. Sólo puede
+	// existir una copia corrupta: la válida ya devolvió arriba bajo el mutex.
+	if _, err := os.Stat(p); err == nil {
+		if err := os.Remove(p); err != nil {
+			return false, err
+		}
+	}
+	if err := os.Rename(tmpName, p); err != nil {
+		return false, err
+	}
+	// fsync de directorio en Unix. Windows lo rechaza; el archivo ya se
+	// sincronizó antes de publicar en ambas plataformas.
+	if dir, err := os.Open(n.StorageDir); err == nil {
+		_ = dir.Sync()
+		_ = dir.Close()
+	}
+	return true, nil
+}
+
+func (n *Node) gcm() (cipher.AEAD, error) {
+	if len(n.Config.EncryptionKey) != 32 {
+		return nil, errors.New("clave AES-256 no válida")
+	}
+	block, err := aes.NewCipher(n.Config.EncryptionKey)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
+}
+
+func (n *Node) encrypt(id string, plain []byte) ([]byte, error) {
+	gcm, err := n.gcm()
+	if err != nil {
+		return nil, err
+	}
+	nonce := make([]byte, gcm.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, err
+	}
+	sealed := append(append([]byte{}, blockMagic...), nonce...)
+	return gcm.Seal(sealed, nonce, plain, []byte(id)), nil
+}
+
+func (n *Node) readBlockLocked(id string) ([]byte, error) {
+	f, err := os.Open(filepath.Join(n.StorageDir, id))
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	gcm, err := n.gcm()
+	if err != nil {
+		return nil, err
+	}
+	maxSealed := maxBlockSize + int64(len(blockMagic)+gcm.NonceSize()+gcm.Overhead())
+	sealed, err := io.ReadAll(io.LimitReader(f, maxSealed+1))
+	if err != nil {
+		return nil, err
+	}
+	start := len(blockMagic)
+	if int64(len(sealed)) > maxSealed || len(sealed) < start+gcm.NonceSize()+gcm.Overhead() || !bytes.Equal(sealed[:start], blockMagic) {
+		return nil, errors.New("formato de bloque cifrado no válido")
+	}
+	nonce := sealed[start : start+gcm.NonceSize()]
+	plain, err := gcm.Open(nil, nonce, sealed[start+gcm.NonceSize():], []byte(id))
+	if err != nil {
+		return nil, errors.New("autenticación AES-GCM falló")
+	}
+	if hashID(plain) != id {
+		return nil, errors.New("integridad SHA-256 falló")
+	}
+	return plain, nil
+}
+
+func (n *Node) localInventory() ([]blockInfo, int64) {
+	n.storageMu.Lock()
+	defer n.storageMu.Unlock()
+	return n.inventoryLocked()
+}
+
+func (n *Node) inventoryLocked() ([]blockInfo, int64) {
+	blocks := []blockInfo{}
+	var used int64
+	entries, err := os.ReadDir(n.StorageDir)
+	if err != nil {
+		log.Printf("leer inventario %s: %v", n.ID, err)
+		return blocks, used
+	}
+	for _, e := range entries {
+		if e.IsDir() || !validID(e.Name()) {
+			continue
+		}
+		plain, err := n.readBlockLocked(e.Name())
+		if err != nil {
+			log.Printf("excluyendo bloque corrupto %s: %v", e.Name(), err)
+			continue
+		}
+		size := int64(len(plain))
+		blocks = append(blocks, blockInfo{BlockID: e.Name(), Size: size})
+		used += size
+	}
+	return blocks, used
 }

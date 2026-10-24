@@ -2,164 +2,261 @@ package main
 
 import (
 	"crypto/rand"
+	"dfsha/internal/common"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"path"
 	"sort"
+	"strconv"
 	"time"
 )
 
-// uploadPlan reserva la ruta y responde con el plan de escritura: tamaño de
-// bloque, número de bloques y DataNodes destino de cada bloque. El archivo
-// queda "en curso" y no es visible hasta el commit.
+func newUploadID() string {
+	b := make([]byte, 16)
+	if _, e := rand.Read(b); e != nil {
+		panic(e)
+	}
+	return hex.EncodeToString(b)
+}
+func (s *Server) decorate(up *UploadSession) {
+	for i := range up.Blocks {
+		for j := range up.Blocks[i].Targets {
+			t := &up.Blocks[i].Targets[j]
+			t.Token = common.Sign(common.Claims{Kind: "block-write", User: up.Owner, Block: "*", Node: t.Node, Exp: up.ExpiresAt.Unix(), MaxSize: up.BlockSize}, s.cfg.Security.SigningKey)
+		}
+	}
+}
 func (s *Server) uploadPlan(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w)
+	var q struct {
+		Path   string
+		Size   int64
+		SHA256 string
+		Handle string
+	}
+	if !decode(w, r, &q) {
 		return
 	}
-	var req struct {
-		Path string `json:"path"`
-		Size int64  `json:"size"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		badRequest(w, err)
+	p, ok := remote(w, q.Path)
+	if !ok {
 		return
 	}
-	remote := cleanRemote(req.Path)
-	if req.Size < 0 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "size inválido"})
+	if q.Size < 0 || !common.ValidID(q.SHA256) {
+		fail(w, 400, "size>=0 y sha256 hexadecimal obligatorios")
 		return
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.dirs[path.Dir(remote)] {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "directorio padre no existe"})
+	u := owner(r)
+	v := s.state()
+	if !v.Dirs[key(u, path.Dir(p))] {
+		fail(w, 404, "padre no existe")
 		return
 	}
-	if s.hasActiveReservation(remote) {
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "reserva activa para esta ruta"})
+	if v.Dirs[key(u, p)] {
+		fail(w, 409, "ruta es directorio")
+		return
+	}
+	if q.Handle != "" {
+		h, e := handleFor(v, u, q.Handle, p, "w")
+		if e != nil {
+			fail(w, 410, e.Error())
+			return
+		}
+		h.ExpiresAt = time.Now().Add(s.cfg.WriteLeaseTTL)
+	}
+	if reserved(v, u, p, q.Handle) {
+		fail(w, 409, "reserva activa para ruta")
 		return
 	}
 	nodes := s.aliveNodes()
 	if len(nodes) == 0 {
-		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "no hay DataNodes vivos"})
+		fail(w, 503, "no hay DataNodes vivos")
 		return
 	}
-
-	blockSize := chooseBlockSize(req.Size, len(nodes), s.cfg.BlockSizing)
-	nBlocks := numberOfBlocks(req.Size, blockSize)
-	targetCopies, copies := copiesPerBlock(s.cfg.ReplicationFactor, len(s.nodes), len(nodes))
-	if !fitsInCluster(nodes, req.Size, copies) {
-		writeJSON(w, http.StatusInsufficientStorage, map[string]any{"error": "no hay espacio suficiente en el clúster"})
+	bs := chooseBlockSize(q.Size, len(nodes), s.cfg.BlockSizing)
+	count := numberOfBlocks(q.Size, bs)
+	if count > 100000 {
+		fail(w, 413, "demasiados bloques para plano de control académico")
 		return
 	}
-	if copies < targetCopies {
-		log.Printf("aviso: %s se guarda con %d copia(s) de %d, solo hay %d DataNode(s) vivo(s)", remote, copies, targetCopies, len(nodes))
+	target, copies := copiesPerBlock(s.cfg.ReplicationFactor, len(s.nodes), len(nodes))
+	_ = target
+	// Reserve capacity of other in-flight plans as well as bytes already on disk.
+	for _, up := range v.Uploads {
+		if time.Now().Before(up.ExpiresAt) {
+			for _, b := range up.Blocks {
+				for _, t := range b.Targets {
+					for _, n := range nodes {
+						if n.NodeID == t.Node {
+							n.Used += up.BlockSize
+						}
+					}
+				}
+			}
+		}
 	}
-	plans := placeBlocks(nodes, nBlocks, blockSize, copies)
-
-	up := &UploadSession{
-		UploadID:  newUploadID(),
-		Owner:     demoUser,
-		Path:      remote,
-		Size:      req.Size,
-		BlockSize: blockSize,
-		NBlocks:   nBlocks,
-		ExpiresAt: time.Now().Add(s.cfg.WriteLeaseTTL),
-		Blocks:    plans,
+	plans := make([]BlockPlan, count)
+	virtual := map[string]int64{}
+	for _, n := range nodes {
+		virtual[n.NodeID] = n.Used
 	}
-	s.uploads[up.UploadID] = up
-	writeJSON(w, http.StatusOK, map[string]any{"upload_id": up.UploadID, "block_size": blockSize, "n_blocks": nBlocks, "lease_expires_at": up.ExpiresAt, "blocks": plans})
-}
-
-// uploadCommit publica el archivo cuando el cliente confirma que subió todos
-// los bloques. Es el único momento en que el archivo pasa a ser visible.
-func (s *Server) uploadCommit(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w)
-		return
-	}
-	var req struct {
-		UploadID string        `json:"upload_id"`
-		Blocks   []StoredBlock `json:"blocks"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		badRequest(w, err)
-		return
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	up, ok := s.uploads[req.UploadID]
-	if !ok {
-		writeJSON(w, http.StatusGone, map[string]any{"error": "upload_id inexistente o vencido"})
-		return
-	}
-	if time.Now().After(up.ExpiresAt) {
-		delete(s.uploads, req.UploadID)
-		writeJSON(w, http.StatusGone, map[string]any{"error": "reserva vencida"})
-		return
-	}
-	if len(req.Blocks) != up.NBlocks {
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "faltan bloques"})
-		return
-	}
-	sort.Slice(req.Blocks, func(i, j int) bool { return req.Blocks[i].Index < req.Blocks[j].Index })
-	for i, b := range req.Blocks {
-		if b.Index != i || b.BlockID == "" || len(b.StoredOn) == 0 {
-			writeJSON(w, http.StatusConflict, map[string]any{"error": fmt.Sprintf("bloque %d inválido", i)})
+	for i := range plans {
+		size := min(bs, max(q.Size-int64(i)*bs, 0))
+		sort.Slice(nodes, func(a, b int) bool {
+			ra := float64(virtual[nodes[a].NodeID]) / float64(nodes[a].Capacity)
+			rb := float64(virtual[nodes[b].NodeID]) / float64(nodes[b].Capacity)
+			if ra == rb {
+				return nodes[a].NodeID < nodes[b].NodeID
+			}
+			return ra < rb
+		})
+		plans[i] = BlockPlan{Index: i, Targets: []Target{}}
+		for _, n := range nodes {
+			if float64(virtual[n.NodeID]+size+32) > float64(n.Capacity)*s.cfg.FullThreshold {
+				continue
+			}
+			plans[i].Targets = append(plans[i].Targets, Target{Node: n.NodeID, URL: n.URL})
+			virtual[n.NodeID] += size + 32
+			if len(plans[i].Targets) == copies {
+				break
+			}
+		}
+		if len(plans[i].Targets) < copies {
+			fail(w, 507, "capacidad insuficiente por nodo o umbral de ocupación")
 			return
 		}
 	}
-	s.files[up.Path] = &FileMeta{Path: up.Path, Owner: up.Owner, Size: up.Size, BlockSize: up.BlockSize, Blocks: req.Blocks, CreatedAt: time.Now()}
-	delete(s.uploads, req.UploadID)
-	writeJSON(w, http.StatusOK, map[string]any{"status": "publicado", "path": up.Path})
-}
-
-// uploadAbort libera la reserva de una subida que el cliente no va a terminar.
-func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w)
+	up := &UploadSession{UploadID: newUploadID(), Owner: u, Path: p, Size: q.Size, SHA256: q.SHA256, BlockSize: bs, NBlocks: count, ExpiresAt: time.Now().Add(s.cfg.WriteLeaseTTL), Blocks: plans, Handle: q.Handle}
+	v.Uploads[up.UploadID] = up
+	if !s.persist(w, v) {
 		return
 	}
-	var req struct {
+	s.decorate(up)
+	writeJSON(w, 200, up)
+}
+func (s *Server) uploadRenew(w http.ResponseWriter, r *http.Request) {
+	var q struct {
 		UploadID string `json:"upload_id"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		badRequest(w, err)
+	if !decode(w, r, &q) {
 		return
 	}
-	s.mu.Lock()
-	delete(s.uploads, req.UploadID)
-	s.mu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
-}
-
-// hasActiveReservation dice si otra subida tiene reservada la ruta, para que
-// un archivo lo escriba un solo cliente a la vez [Hito 1, N8]. Las reservas
-// vencidas de esa ruta se descartan: así la reserva de un cliente que murió
-// se libera sola. Debe llamarse con s.mu tomado para escritura.
-func (s *Server) hasActiveReservation(remote string) bool {
-	now := time.Now()
-	for id, up := range s.uploads {
-		if up.Path != remote {
-			continue
-		}
-		if now.After(up.ExpiresAt) {
-			delete(s.uploads, id)
-			continue
-		}
-		return true
+	v := s.state()
+	up := v.Uploads[q.UploadID]
+	if up == nil || up.Owner != owner(r) || time.Now().After(up.ExpiresAt) {
+		fail(w, 410, "reserva vencida")
+		return
 	}
-	return false
-}
-
-func newUploadID() string {
-	b := make([]byte, 8)
-	if _, err := rand.Read(b); err != nil {
-		return fmt.Sprint(time.Now().UnixNano())
+	up.ExpiresAt = time.Now().Add(s.cfg.WriteLeaseTTL)
+	if h := v.Handles[up.Handle]; h != nil {
+		h.ExpiresAt = up.ExpiresAt
 	}
-	return hex.EncodeToString(b)
+	if !s.persist(w, v) {
+		return
+	}
+	s.decorate(up)
+	writeJSON(w, 200, up)
+}
+func (s *Server) verifyBlock(n *NodeInfo, b StoredBlock, blockOwner ...string) bool {
+	req, _ := http.NewRequest("HEAD", n.URL+"/blocks/"+b.BlockID, nil)
+	req.Header.Set("X-Cluster-Key", s.cfg.Security.ClusterKey)
+	if len(blockOwner) > 0 {
+		req.Header.Set("X-Block-Owner", blockOwner[0])
+	}
+	resp, e := s.client.Do(req)
+	if e != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == 200 && resp.Header.Get("X-Block-SHA256") == b.BlockID && resp.Header.Get("Content-Length") == strconv.FormatInt(b.Size, 10)
+}
+func (s *Server) uploadCommit(w http.ResponseWriter, r *http.Request) {
+	var q struct {
+		UploadID string        `json:"upload_id"`
+		Blocks   []StoredBlock `json:"blocks"`
+		SHA256   string        `json:"sha256"`
+	}
+	if !decode(w, r, &q) {
+		return
+	}
+	u := owner(r)
+	v := s.state()
+	if f := v.Completed[q.UploadID]; f != nil {
+		if f.Owner != u {
+			fail(w, 403, "subida de otro usuario")
+			return
+		}
+		if q.SHA256 != f.SHA256 {
+			fail(w, 409, "commit distinto")
+			return
+		}
+		writeJSON(w, 200, map[string]any{"status": "publicado", "path": f.Path, "idempotent": true})
+		return
+	}
+	up := v.Uploads[q.UploadID]
+	if up == nil || up.Owner != u || time.Now().After(up.ExpiresAt) {
+		fail(w, 410, "reserva inválida o vencida")
+		return
+	}
+	if len(q.Blocks) != up.NBlocks || q.SHA256 != up.SHA256 {
+		fail(w, 409, "tamaño de manifiesto o SHA inválido")
+		return
+	}
+	sort.Slice(q.Blocks, func(i, j int) bool { return q.Blocks[i].Index < q.Blocks[j].Index })
+	for i := range q.Blocks {
+		b := &q.Blocks[i]
+		expected := min(up.BlockSize, max(up.Size-int64(i)*up.BlockSize, 0))
+		if b.Index != i || b.Size != expected || !common.ValidID(b.BlockID) {
+			fail(w, 409, fmt.Sprintf("bloque%d inválido", i))
+			return
+		}
+		verified := []string{}
+		for _, t := range up.Blocks[i].Targets {
+			n := s.nodes[t.Node]
+			if n != nil && s.isAlive(n) && s.verifyBlock(n, *b, u) {
+				verified = append(verified, t.Node)
+			}
+		}
+		if len(verified) != len(up.Blocks[i].Targets) {
+			fail(w, 409, "faltan réplicas verificadas del plan")
+			return
+		}
+		b.StoredOn = verified
+	}
+	if time.Now().After(up.ExpiresAt) {
+		fail(w, 410, "reserva vencida durante verificación")
+		return
+	}
+	f := &FileMeta{Path: up.Path, Owner: u, Size: up.Size, SHA256: up.SHA256, BlockSize: up.BlockSize, Blocks: q.Blocks, CreatedAt: time.Now()}
+	v.Files[key(u, up.Path)] = f
+	v.Completed[q.UploadID] = f
+	delete(v.Uploads, q.UploadID)
+	if h := v.Handles[up.Handle]; h != nil {
+		h.File = f
+		h.ExpiresAt = time.Now().Add(s.cfg.WriteLeaseTTL)
+	}
+	if s.persist(w, v) {
+		writeJSON(w, 200, map[string]any{"status": "publicado", "path": up.Path, "replicas_ok": s.liveReplicas(f.Blocks)})
+	}
+}
+func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
+	var q struct {
+		UploadID string `json:"upload_id"`
+	}
+	if !decode(w, r, &q) {
+		return
+	}
+	v := s.state()
+	up := v.Uploads[q.UploadID]
+	if up == nil {
+		w.WriteHeader(204)
+		return
+	}
+	if up.Owner != owner(r) {
+		fail(w, 403, "subida de otro usuario")
+		return
+	}
+	delete(v.Uploads, q.UploadID)
+	if s.persist(w, v) {
+		w.WriteHeader(204)
+	}
 }

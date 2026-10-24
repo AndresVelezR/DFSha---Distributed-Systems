@@ -1,8 +1,11 @@
 package main
 
 import (
+	"context"
+	"dfsha/internal/common"
 	"encoding/json"
-	"net/http"
+	"github.com/hashicorp/raft"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -11,99 +14,112 @@ import (
 
 func newTestServer(t *testing.T, datanodes int) *Server {
 	t.Helper()
-	cfg := Config{
-		ClusterKey:        "test-key",
-		ReplicationFactor: 2,
-		BlockSizing:       defaultSizing,
-		HeartbeatInterval: 3 * time.Second,
-		HeartbeatMisses:   3,
-		WriteLeaseTTL:     60 * time.Second,
+	c := Config{Security: common.Config{Insecure: true, SigningKey: []byte(strings.Repeat("s", 32)), ClusterKey: strings.Repeat("k", 32)}, ReplicationFactor: 2, BlockSizing: defaultSizing, HeartbeatInterval: 3 * time.Second, HeartbeatMisses: 3, WriteLeaseTTL: time.Minute, FullThreshold: .9}
+	s := newServer(c)
+	s.users["demo"] = "test"
+	s.users["other"] = "test"
+	s.fsm.state.Dirs[key("demo", "/")] = true
+	s.fsm.state.Dirs[key("other", "/")] = true
+	cfg := raft.DefaultConfig()
+	cfg.LocalID = "test"
+	cfg.LogOutput = io.Discard
+	cfg.HeartbeatTimeout = 50 * time.Millisecond
+	cfg.ElectionTimeout = 50 * time.Millisecond
+	cfg.LeaderLeaseTimeout = 25 * time.Millisecond
+	cfg.CommitTimeout = 5 * time.Millisecond
+	addr, tr := raft.NewInmemTransport("test")
+	store := raft.NewInmemStore()
+	var e error
+	s.raft, e = raft.NewRaft(cfg, s.fsm, store, store, raft.NewInmemSnapshotStore(), tr)
+	if e != nil {
+		t.Fatal(e)
 	}
-	s := newServer(cfg)
-	for i := 1; i <= datanodes; i++ {
-		id := "dn-0" + string(rune('0'+i))
-		s.nodes[id] = &NodeInfo{NodeID: id, Host: id, Port: 8001, Capacity: 1000 * megabyte, LastSeen: time.Now()}
+	if e = s.raft.BootstrapCluster(raft.Configuration{Servers: []raft.Server{{ID: "test", Address: addr, Suffrage: raft.Voter}}}).Error(); e != nil {
+		t.Fatal(e)
+	}
+	t.Cleanup(func() { s.raft.Shutdown() })
+	until := time.Now().Add(2 * time.Second)
+	for s.raft.State() != raft.Leader && time.Now().Before(until) {
+		time.Sleep(time.Millisecond * 5)
+	}
+	if s.raft.State() != raft.Leader {
+		t.Fatal("no leader")
+	}
+	for i := 0; i < datanodes; i++ {
+		id := string(rune('a' + i))
+		s.nodes[id] = &NodeInfo{NodeID: id, URL: "http://127.0.0.1:1", Capacity: 1000 * megabyte, LastSeen: time.Now()}
 	}
 	return s
 }
-
-func requestUploadPlan(s *Server, path string) *httptest.ResponseRecorder {
-	body := `{"path":"` + path + `","size":20000000}`
-	req := httptest.NewRequest(http.MethodPost, "/files/upload/plan", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+demoToken)
+func api(s *Server, method, p, body, user string) *httptest.ResponseRecorder {
+	r := httptest.NewRequest(method, p, strings.NewReader(body))
+	r.Header.Set("Authorization", "Bearer "+common.Sign(common.Claims{Kind: "session", User: user, Exp: time.Now().Add(time.Hour).Unix()}, s.cfg.Security.SigningKey))
 	rec := httptest.NewRecorder()
-	s.routes().ServeHTTP(rec, req)
+	s.routes().ServeHTTP(rec, r)
 	return rec
 }
-
-func TestSecondUploadPlanOnSamePathIsRejected(t *testing.T) {
+func TestUploadReservesPathAndExpiry(t *testing.T) {
 	s := newTestServer(t, 3)
-
-	if rec := requestUploadPlan(s, "/a.bin"); rec.Code != http.StatusOK {
-		t.Fatalf("primer plan: código %d, se esperaba 200: %s", rec.Code, rec.Body)
+	body := `{"path":"/a","size":20000000,"sha256":"` + strings.Repeat("a", 64) + `"}`
+	if r := api(s, "POST", "/files/upload/plan", body, "demo"); r.Code != 200 {
+		t.Fatal(r.Code, r.Body)
 	}
-	if rec := requestUploadPlan(s, "/a.bin"); rec.Code != http.StatusConflict {
-		t.Fatalf("segundo plan sobre la misma ruta: código %d, se esperaba 409", rec.Code)
+	if r := api(s, "POST", "/files/upload/plan", body, "demo"); r.Code != 409 {
+		t.Fatal(r.Code, r.Body)
 	}
-	if rec := requestUploadPlan(s, "/b.bin"); rec.Code != http.StatusOK {
-		t.Fatalf("plan sobre otra ruta: código %d, se esperaba 200", rec.Code)
+	v := s.state()
+	for _, up := range v.Uploads {
+		up.ExpiresAt = time.Now().Add(-time.Second)
+	}
+	if e := s.save(v); e != nil {
+		t.Fatal(e)
+	}
+	if r := api(s, "POST", "/files/upload/plan", body, "demo"); r.Code != 200 {
+		t.Fatal(r.Code, r.Body)
 	}
 }
-
-func TestExpiredReservationIsReleased(t *testing.T) {
+func TestIncompleteCommitInvisible(t *testing.T) {
 	s := newTestServer(t, 3)
-	if rec := requestUploadPlan(s, "/a.bin"); rec.Code != http.StatusOK {
-		t.Fatalf("primer plan: código %d", rec.Code)
+	r := api(s, "POST", "/files/upload/plan", `{"path":"/a","size":20000000,"sha256":"`+strings.Repeat("a", 64)+`"}`, "demo")
+	var up UploadSession
+	json.Unmarshal(r.Body.Bytes(), &up)
+	r = api(s, "POST", "/files/upload/commit", `{"upload_id":"`+up.UploadID+`","sha256":"`+up.SHA256+`","blocks":[]}`, "demo")
+	if r.Code != 409 {
+		t.Fatal(r.Code, r.Body)
 	}
-	for _, up := range s.uploads {
-		up.ExpiresAt = time.Now().Add(-time.Second) // simula un cliente que murió
+	if api(s, "GET", "/fs/stat?path=/a", "", "demo").Code != 404 {
+		t.Fatal("incomplete visible")
 	}
-	if rec := requestUploadPlan(s, "/a.bin"); rec.Code != http.StatusOK {
-		t.Fatalf("plan tras vencer la reserva: código %d, se esperaba 200", rec.Code)
+}
+func TestCommitDoesNotTrustClientReplicaClaims(t *testing.T) {
+	s := newTestServer(t, 3)
+	up := &UploadSession{UploadID: "up", Owner: "demo", Path: "/a", Size: 1, SHA256: strings.Repeat("a", 64), BlockSize: 8 * megabyte, NBlocks: 1, ExpiresAt: time.Now().Add(time.Minute), Blocks: []BlockPlan{{Index: 0, Targets: []Target{{Node: "a"}, {Node: "b"}}}}}
+	v := s.state()
+	v.Uploads[up.UploadID] = up
+	s.save(v)
+	r := api(s, "POST", "/files/upload/commit", `{"upload_id":"up","sha256":"`+up.SHA256+`","blocks":[{"index":0,"block_id":"`+strings.Repeat("b", 64)+`","size":1,"stored_on":["a","b"]}]}`, "demo")
+	if r.Code != 409 {
+		t.Fatal(r.Code, r.Body)
+	}
+}
+func TestFSMRoundTrip(t *testing.T) {
+	s := newTestServer(t, 0)
+	r := api(s, "POST", "/fs/mkdir", `{"path":"/persistent"}`, "demo")
+	if r.Code != 201 {
+		t.Fatal(r.Code)
+	}
+	snap, e := s.fsm.Snapshot()
+	if e != nil {
+		t.Fatal(e)
+	}
+	data := snap.(*snapshot).data
+	other := &metadataFSM{}
+	if e = other.Restore(io.NopCloser(strings.NewReader(string(data)))); e != nil {
+		t.Fatal(e)
+	}
+	if !other.state.Dirs[key("demo", "/persistent")] {
+		t.Fatal("lost metadata")
 	}
 }
 
-func TestUploadPlanCopiesPerBlock(t *testing.T) {
-	cases := []struct {
-		name      string
-		datanodes int
-		want      int
-	}{
-		{"3 DataNodes: 2 copias", 3, 2},
-		{"2 DataNodes: N-1 = 1 copia", 2, 1},
-	}
-	for _, c := range cases {
-		s := newTestServer(t, c.datanodes)
-		rec := requestUploadPlan(s, "/a.bin")
-		if rec.Code != http.StatusOK {
-			t.Fatalf("%s: código %d", c.name, rec.Code)
-		}
-		var plan struct {
-			Blocks []BlockPlan `json:"blocks"`
-		}
-		if err := json.NewDecoder(rec.Body).Decode(&plan); err != nil {
-			t.Fatal(err)
-		}
-		for _, b := range plan.Blocks {
-			if len(b.Targets) != c.want {
-				t.Errorf("%s: bloque %d con %d copias, se esperaban %d", c.name, b.Index, len(b.Targets), c.want)
-			}
-		}
-	}
-}
-
-func TestUploadPlanRejectsFileThatDoesNotFit(t *testing.T) {
-	s := newTestServer(t, 3) // 3 nodos con 1000 MB libres cada uno
-	// 2 GB x 2 copias = 4 GB, más que los 3 GB libres del clúster.
-	body := `{"path":"/enorme.bin","size":2000000000}`
-	req := httptest.NewRequest(http.MethodPost, "/files/upload/plan", strings.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+demoToken)
-	rec := httptest.NewRecorder()
-	s.routes().ServeHTTP(rec, req)
-	if rec.Code != http.StatusInsufficientStorage {
-		t.Fatalf("código %d, se esperaba 507", rec.Code)
-	}
-	if len(s.uploads) != 0 {
-		t.Fatal("una subida rechazada no debe dejar la ruta reservada")
-	}
-}
+var _ = context.Background

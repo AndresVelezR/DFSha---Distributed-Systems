@@ -1,194 +1,235 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
+	"bytes"
+	"crypto/subtle"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+	"time"
+
+	"dfsha/internal/common"
 )
 
+func fail(w http.ResponseWriter, status int, message string) {
+	common.JSON(w, status, map[string]any{"error": message})
+}
+
 func (n *Node) health(w http.ResponseWriter, r *http.Request) {
-	blocks, used := storedBlocks(n.StorageDir)
-	writeJSON(w, http.StatusOK, map[string]any{"node_id": n.ID, "capacity": diskCapacity(n.StorageDir), "used": used, "n_blocks": blocks})
+	if r.Method != http.MethodGet {
+		fail(w, http.StatusMethodNotAllowed, "método no permitido")
+		return
+	}
+	common.JSON(w, http.StatusOK, map[string]any{"status": "ok", "node_id": n.ID})
 }
 
-// authorized acepta al cliente (token) o a otro nodo del clúster (clave).
-func (n *Node) authorized(r *http.Request) bool {
-	return r.Header.Get("Authorization") == "Bearer "+n.ClientToken || r.Header.Get("X-Cluster-Key") == n.ClusterKey
+func (n *Node) clusterAuthorized(r *http.Request) bool {
+	return n.Config.ClusterKey != "" && subtle.ConstantTimeCompare([]byte(r.Header.Get("X-Cluster-Key")), []byte(n.Config.ClusterKey)) == 1
 }
 
-// blocks enruta /blocks/{id} y /blocks/{id}/replicate.
+func (n *Node) authorize(r *http.Request, kind, id string) (common.Claims, bool) {
+	if n.clusterAuthorized(r) {
+		return common.Claims{Kind: kind, Block: id, Node: n.ID, MaxSize: maxBlockSize}, true
+	}
+	auth := r.Header.Get("Authorization")
+	if !strings.HasPrefix(auth, "Bearer ") {
+		return common.Claims{}, false
+	}
+	c, err := common.Verify(strings.TrimPrefix(auth, "Bearer "), n.Config.SigningKey)
+	validBlock := c.Block == id || (kind == "block-write" && c.Block == "*")
+	return c, err == nil && c.Kind == kind && c.Node == n.ID && validBlock
+}
+
 func (n *Node) blocks(w http.ResponseWriter, r *http.Request) {
-	if !n.authorized(r) {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "no autorizado"})
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/blocks/"), "/")
+	if len(parts) == 0 || !validID(parts[0]) || len(parts) > 2 || (len(parts) == 2 && parts[1] != "replicate") {
+		fail(w, http.StatusBadRequest, "block id debe ser SHA-256 hexadecimal en minúsculas")
 		return
 	}
-	rest := strings.TrimPrefix(r.URL.Path, "/blocks/")
-	if rest == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "block id requerido"})
-		return
-	}
-	if strings.HasSuffix(rest, "/replicate") {
-		n.replicate(w, r, strings.TrimSuffix(rest, "/replicate"))
-		return
-	}
-	id := filepath.Base(rest)
-	if len(id) != 64 {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "block id debe ser SHA-256 hexadecimal"})
+	id := parts[0]
+	if len(parts) == 2 {
+		n.replicate(w, r, id)
 		return
 	}
 	switch r.Method {
 	case http.MethodPut:
-		n.putBlock(w, r, id)
-	case http.MethodGet:
+		claims, ok := n.authorize(r, "block-write", id)
+		if !ok {
+			fail(w, http.StatusUnauthorized, "capacidad de escritura no válida")
+			return
+		}
+		n.putBlock(w, r, id, claims)
+	case http.MethodGet, http.MethodHead:
+		if _, ok := n.authorize(r, "block-read", id); !ok {
+			fail(w, http.StatusUnauthorized, "capacidad de lectura no válida")
+			return
+		}
 		n.getBlock(w, r, id)
 	case http.MethodDelete:
+		if !n.clusterAuthorized(r) {
+			fail(w, http.StatusUnauthorized, "requiere autenticación interna")
+			return
+		}
 		n.deleteBlock(w, r, id)
 	default:
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "método no permitido"})
+		fail(w, http.StatusMethodNotAllowed, "método no permitido")
 	}
 }
 
-// putBlock guarda el bloque y lo propaga a los DataNodes de X-Forward-To.
-// Es idempotente: si el bloque ya existe (un reintento del cliente, o el
-// mismo contenido en otro archivo) no se reescribe, pero sí se propaga, para
-// que las demás copias existan igual. Responde 201 si lo creó y 200 si ya estaba.
-func (n *Node) putBlock(w http.ResponseWriter, r *http.Request, id string) {
-	dst := filepath.Join(n.StorageDir, id)
-	status := http.StatusCreated
-	if _, err := os.Stat(dst); err == nil {
-		// Se consume el cuerpo para que el cliente termine de enviar sin error.
-		_, _ = io.Copy(io.Discard, r.Body)
-		status = http.StatusOK
-	} else if !n.storeVerifiedBlock(w, r.Body, id, dst) {
+// Cada bloque AES-GCM se autentica completo. La memoria está acotada por el
+// máximo de 64 MiB por solicitud; nunca se carga un archivo completo.
+func (n *Node) putBlock(w http.ResponseWriter, r *http.Request, id string, claims common.Claims) {
+	limit := maxBlockSize
+	if claims.MaxSize > 0 && claims.MaxSize < limit {
+		limit = claims.MaxSize
+	}
+	if r.ContentLength > limit {
+		fail(w, http.StatusRequestEntityTooLarge, "bloque excede el tamaño autorizado")
 		return
 	}
-	stored := append([]string{n.ID}, n.forwardToPeers(r, id, dst)...)
-	writeJSON(w, status, map[string]any{"block_id": id, "size": fileSize(dst), "stored_on": stored})
-}
-
-// storeVerifiedBlock escribe body en dst solo si su SHA-256 coincide con id.
-// Escribe primero a un .tmp y lo renombra, para que nunca quede visible un
-// bloque a medias. Si falla, ya respondió el error y devuelve false.
-func (n *Node) storeVerifiedBlock(w http.ResponseWriter, body io.Reader, id, dst string) bool {
-	tmp := dst + ".tmp"
-	f, err := os.Create(tmp)
+	plain, err := io.ReadAll(io.LimitReader(r.Body, limit+1))
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return false
+		fail(w, http.StatusBadRequest, "no se pudo leer bloque")
+		return
 	}
-	h := sha256.New()
-	_, err = io.Copy(io.MultiWriter(f, h), body)
-	closeErr := f.Close()
-	if err != nil || closeErr != nil {
-		_ = os.Remove(tmp)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "falló escritura"})
-		return false
+	if int64(len(plain)) > limit {
+		fail(w, http.StatusRequestEntityTooLarge, "bloque excede el tamaño autorizado")
+		return
 	}
-	if got := hex.EncodeToString(h.Sum(nil)); got != id {
-		_ = os.Remove(tmp)
-		writeJSON(w, http.StatusConflict, map[string]any{"error": "SHA-256 no coincide", "expected": id, "got": got})
-		return false
+	if hashID(plain) != id {
+		fail(w, http.StatusConflict, "SHA-256 no coincide")
+		return
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(tmp)
-		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
-		return false
+	targets, err := n.targets(r, id, int64(len(plain)))
+	if err != nil {
+		fail(w, http.StatusBadRequest, err.Error())
+		return
 	}
-	return true
-}
-
-// forwardToPeers envía el bloque a cada URL de X-Forward-To y devuelve los
-// node_id que lo recibieron. El node_id de la i-ésima URL viene en la
-// cabecera X-Forward-Node-i (empezando en 1); si falta, se usa la URL.
-func (n *Node) forwardToPeers(r *http.Request, id, file string) []string {
-	forward := strings.TrimSpace(r.Header.Get("X-Forward-To"))
-	if forward == "" {
-		return nil
+	created, err := n.store(id, plain)
+	if err != nil {
+		if errors.Is(err, errCapacity) {
+			fail(w, http.StatusInsufficientStorage, err.Error())
+		} else {
+			log.Printf("almacenar %s: %v", id, err)
+			fail(w, http.StatusInternalServerError, "falló almacenamiento de bloque")
+		}
+		return
 	}
-	stored := []string{}
-	for i, target := range strings.Split(forward, ",") {
-		target = strings.TrimSpace(target)
-		if target == "" {
+	if claims.User != "" {
+		if err := n.recordOwner(id, claims.User); err != nil {
+			fail(w, 500, "falló registro de autoría del bloque")
+			return
+		}
+	}
+	stored := []string{n.ID}
+	// Un reintento debe propagar incluso si el primario ya tenía el bloque.
+	for _, target := range targets {
+		if err := n.forwardBlock(r.Context(), target, id, plain, false); err != nil {
+			log.Printf("réplica %s -> %s: %v", id, target.Node, err)
 			continue
 		}
-		if err := n.forwardFile(target, id, file); err != nil {
-			log.Printf("forward %s -> %s falló: %v", id, target, err)
-			continue
-		}
-		nodeID := r.Header.Get("X-Forward-Node-" + strconv.Itoa(i+1))
-		if nodeID == "" {
-			nodeID = target
-		}
-		stored = append(stored, nodeID)
+		stored = append(stored, target.Node)
 	}
-	return stored
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+	common.JSON(w, status, map[string]any{"block_id": id, "size": len(plain), "stored_on": stored})
 }
 
-// getBlock entrega el bloque; http.ServeContent atiende la cabecera Range.
 func (n *Node) getBlock(w http.ResponseWriter, r *http.Request, id string) {
-	p := filepath.Join(n.StorageDir, id)
-	f, err := os.Open(p)
+	if user := r.Header.Get("X-Block-Owner"); user != "" {
+		if !n.clusterAuthorized(r) {
+			fail(w, 401, "requiere autenticación interna")
+			return
+		}
+		if !n.hasOwner(id, user) {
+			fail(w, 404, "esta cuenta no ha presentado el contenido del bloque")
+			return
+		}
+	}
+	n.storageMu.Lock()
+	plain, err := n.readBlockLocked(id)
+	n.storageMu.Unlock()
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "bloque no existe"})
+		if os.IsNotExist(err) {
+			fail(w, http.StatusNotFound, "bloque no existe")
+		} else {
+			log.Printf("integridad %s: %v", id, err)
+			fail(w, http.StatusInternalServerError, "bloque corrupto o ilegible")
+		}
 		return
 	}
-	defer f.Close()
-	st, _ := f.Stat()
 	w.Header().Set("Content-Type", "application/octet-stream")
-	http.ServeContent(w, r, id, st.ModTime(), f)
+	w.Header().Set("X-Block-SHA256", id)
+	w.Header().Set("ETag", `"`+id+`"`)
+	http.ServeContent(w, r, id, time.Time{}, bytes.NewReader(plain))
 }
 
-// deleteBlock solo lo puede pedir un nodo del clúster, nunca el cliente.
 func (n *Node) deleteBlock(w http.ResponseWriter, r *http.Request, id string) {
-	if r.Header.Get("X-Cluster-Key") != n.ClusterKey {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "requiere X-Cluster-Key"})
+	n.storageMu.Lock()
+	err := os.Remove(filepath.Join(n.StorageDir, id))
+	if err == nil || os.IsNotExist(err) {
+		n.removeOwnersLocked(id)
+	}
+	n.storageMu.Unlock()
+	if err != nil && !os.IsNotExist(err) {
+		fail(w, http.StatusInternalServerError, "falló eliminación")
 		return
 	}
-	if err := os.Remove(filepath.Join(n.StorageDir, id)); err != nil && os.IsNotExist(err) {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "bloque no existe"})
-		return
-	}
+	// Idempotente ante pérdida de la respuesta de una eliminación previa.
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// replicate copia un bloque local a otro DataNode por orden del clúster.
 func (n *Node) replicate(w http.ResponseWriter, r *http.Request, id string) {
 	if r.Method != http.MethodPost {
-		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "método no permitido"})
+		fail(w, http.StatusMethodNotAllowed, "método no permitido")
 		return
 	}
-	if r.Header.Get("X-Cluster-Key") != n.ClusterKey {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "requiere X-Cluster-Key"})
+	if !n.clusterAuthorized(r) {
+		fail(w, http.StatusUnauthorized, "requiere autenticación interna")
 		return
 	}
-	var req struct {
-		Target struct {
-			Host string `json:"host"`
-			Port int    `json:"port"`
-		} `json:"target"`
+	var body struct {
+		Target forwardTarget `json:"target"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+	if err := json.NewDecoder(io.LimitReader(r.Body, 8192)).Decode(&body); err != nil || body.Target.Node == "" || body.Target.Node == n.ID || n.validURL(body.Target.URL) != nil {
+		fail(w, http.StatusBadRequest, "destino de réplica no válido")
 		return
 	}
-	base := fmt.Sprintf("http://%s:%d", req.Target.Host, req.Target.Port)
-	if err := n.forwardFile(base, id, filepath.Join(n.StorageDir, id)); err != nil {
-		writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+	n.storageMu.Lock()
+	plain, err := n.readBlockLocked(id)
+	n.storageMu.Unlock()
+	if err != nil {
+		if os.IsNotExist(err) {
+			fail(w, http.StatusNotFound, "bloque no existe")
+		} else {
+			fail(w, http.StatusInternalServerError, "bloque corrupto o ilegible")
+		}
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]any{"status": "replication_started", "target": base})
+	if err := n.forwardBlock(r.Context(), body.Target, id, plain, true); err != nil {
+		log.Printf("reparación %s -> %s: %v", id, body.Target.Node, err)
+		fail(w, http.StatusBadGateway, "falló transferencia de réplica")
+		return
+	}
+	common.JSON(w, http.StatusOK, map[string]any{"block_id": id, "size": len(plain), "stored_on": []string{n.ID, body.Target.Node}})
 }
 
-func writeJSON(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(v)
+func (n *Node) inventory(w http.ResponseWriter, r *http.Request) {
+	if !n.clusterAuthorized(r) {
+		fail(w, http.StatusUnauthorized, "requiere autenticación interna")
+		return
+	}
+	if r.Method != http.MethodGet {
+		fail(w, http.StatusMethodNotAllowed, "método no permitido")
+		return
+	}
+	blocks, used := n.localInventory()
+	common.JSON(w, http.StatusOK, map[string]any{"node_id": n.ID, "blocks": blocks, "used": used, "capacity": n.Capacity})
 }

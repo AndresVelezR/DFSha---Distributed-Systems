@@ -18,6 +18,20 @@ __pycache__/
 
 # Entorno local
 .env
+.secrets/
+.local-session/
+.tools/
+/bin/
+/data/
+/results/
+/tmp/
+/tests-go-results.json
+/enunciado-extraido.txt
+/hito1-extraido.txt
+credentials.txt
+*.key
+session.json
+deploy/aws/*.env
 .idea/
 .vscode/
 .DS_Store

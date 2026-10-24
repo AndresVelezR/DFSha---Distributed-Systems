@@ -1,190 +1,148 @@
-# DFSha — Sistema de archivos distribuido
+# DFSha — sistema de archivos distribuido
 
-Sistema de archivos distribuido **por bloques**, con alta disponibilidad, rendimiento y seguridad. Proyecto 1 de ST0263 Tópicos Especiales en Telemática / SI3007 Sistemas Distribuidos, Universidad EAFIT, 2026-2.
+ST0263 / SI3007, Universidad EAFIT, 2026-2. **Andrés Vélez Rendón y Jose Luis Restrepo.**
 
-Un archivo nunca se guarda completo en una sola máquina ni se carga completo en memoria: el cliente lo parte en bloques, cada bloque se guarda en varios DataNodes, y al descargarlo se reconstruye verificando la firma SHA-256 de cada bloque.
+Servidores Go, cliente Python y bloques binarios distribuidos. Tres ControlNodes conservan metadatos mediante Raft, BoltDB y snapshots; los DataNodes guardan bloques AES-256-GCM con SHA-256, réplicas y reparación. El cliente descubre ubicaciones mediante planes HTTPS. Se continuó el Hito 2 de GitHub, más avanzado que el ZIP.
 
-**Autores:** Andrés Vélez Rendón, Jose Luis Restrepo.
+**Empieza por [COMO_EJECUTAR.md](COMO_EJECUTAR.md).** También se entregan [informe PDF](output/pdf/DFSha-informe-final.pdf), [fuente del informe](docs/INFORME_FINAL.md), [API](docs/API.md), [diagramas](docs/DIAGRAMAS.md), [trazabilidad](docs/TRAZABILIDAD.md), [auditoría](docs/AUDITORIA.md), [guion del video](docs/VIDEO.md) y [despliegue AWS](deploy/aws/README.md).
 
-## Entregas
+## Inicio con Docker
 
-Cada entrega tiene su carpeta en `docs/` y su informe en PDF, todos con el mismo formato.
+Requiere Git, Python >=3.10 y Docker Desktop/Engine con Compose. En Windows iniciar Docker Desktop con contenedores Linux. En Linux puede corresponder `python3`. Ejecutar desde la raíz:
 
-| Hito | Contenido | Informe | Estado |
-|---|---|---|---|
-| 1 | Especificación del proyecto | [`docs/hito-1/hito-1-especificacion.pdf`](docs/hito-1/hito-1-especificacion.pdf) | Entregado |
-| 2 | Arquitectura distribuida y comunicaciones | [`docs/hito-2/hito-2-arquitectura-y-comunicaciones.pdf`](docs/hito-2/hito-2-arquitectura-y-comunicaciones.pdf) | Entregado, etiqueta `hito-2` |
-| 3 | Alta disponibilidad, replicación, consistencia y seguridad | — | Pendiente |
-| 4 | Entrega final | — | Pendiente |
-
-Los informes desde el Hito 2 se escriben en LaTeX con la plantilla común [`docs/plantilla/dfsha-informe.sty`](docs/plantilla/dfsha-informe.sty) y se compilan con `./scripts/build-informes.sh` (requiere TeX Live con LuaLaTeX).
-
-## Arquitectura
-
-Cliente/Servidor con el servicio distribuido (Opción 1), patrón Maestro–Trabajador:
-
-```text
-                        control / metadatos
-+----------------+   REST/JSON   +------------------+
-| Cliente CLI    | ------------> | ControlNode      |
-| (Python)       | <------------ | :8000            |
-+-------+--------+               +---------+--------+
-        |                                   ^
-        | bloques binarios                  | register / heartbeat
-        |                                   |
-        +----------+-------------+----------+
-                   |             |
-             +-----v----+  +-----v----+  +-----v----+
-             | dn-01    |  | dn-02    |  | dn-03    |
-             | :8001    |  | :8001    |  | :8001    |
-             +-----+----+  +-----+----+  +-----+----+
-                   \___________|____________/
-                     réplica entre DataNodes
+```sh
+git clone https://github.com/AndresVelezR/DFSha---Distributed-Systems.git
+cd DFSha---Distributed-Systems
+python scripts/setup.py
+docker compose --profile tools build
+docker compose up -d cn1 cn2 cn3 dn1 dn2 dn3
+docker compose ps
+python scripts/demo.py
 ```
 
-- **ControlNode** (Go): metadatos, DataNodes vivos, planes de lectura y escritura. Nunca recibe datos de archivos.
-- **DataNode** (Go): guarda bloques en disco y propaga copias a otros DataNodes.
-- **Cliente** (Python, sin dependencias): parte, sube, baja y reconstruye archivos. No tiene direcciones de DataNodes configuradas: las recibe en cada plan.
+Esperar seis servicios `healthy`. La primera construcción descarga imágenes y módulos. Setup usa Go dentro de Docker: no necesitas instalar Go para este camino. Genera CA, certificados y claves aleatorias en `.secrets`; el usuario inicial `demo` tiene contraseña aleatoria en `.secrets/credentials.txt`. El servidor lee hashes bcrypt desde `users.json`. El archivo con contraseñas es una comodidad administrativa privada del laboratorio.
 
-El detalle de la arquitectura, los algoritmos, la API y las pruebas está en el [informe del Hito 2](docs/hito-2/hito-2-arquitectura-y-comunicaciones.pdf).
+**Si existen secretos y datos, omite setup.** No cambiar la clave de cifrado ni borrar `.secrets` si se conservan bloques. El inicializador rechaza sobrescribir secretos. Nunca publicar claves, sesiones o contraseñas; están excluidos de Git.
 
-## Estructura del repositorio
+La demo prueba un archivo de 24 MiB, tres bloques, dos réplicas, hashes, rangos, escritor único, escritura COW, archivo vacío y gestión de archivos. Lee las credenciales sin imprimirlas y deja métricas en `demo-files/`.
 
-```text
-.
-├── cmd/
-│   ├── controlnode/     ControlNode: configuración, planificador y endpoints HTTP
-│   └── datanode/        DataNode: almacenamiento de bloques y comunicación con otros nodos
-├── client/              Cliente CLI y sus pruebas
-├── docker/              Un Dockerfile por componente
-├── deploy/aws/          Despliegue en varias VMs (AWS Academy)
-├── docs/
-│   ├── hito-1/          Informe del Hito 1
-│   ├── hito-2/          Informe del Hito 2 (PDF y fuente LaTeX)
-│   └── plantilla/       Formato común de los informes
-├── scripts/
-│   ├── demo.sh          Demostración de punta a punta
-│   └── build-informes.sh
-├── docker-compose.yml   Clúster local: 1 ControlNode + 3 DataNodes (+1 opcional)
-└── go.mod
+## CLI
+
+La raíz del proyecto se monta como `/work`. El cliente de Compose resuelve las direcciones internas de los DataNodes; `client-session` conserva sesión, directorio actual y handles entre invocaciones.
+
+```sh
+docker compose --profile tools run --rm client login demo
+docker compose --profile tools run --rm client mkdir /trabajo
+docker compose --profile tools run --rm client cd /trabajo
+docker compose --profile tools run --rm client put /work/README.md readme.md
+docker compose --profile tools run --rm client ls
+docker compose --profile tools run --rm client stat readme.md
+docker compose --profile tools run --rm client get readme.md /work/demo-files/recuperado.md
+docker compose --profile tools run --rm client read readme.md 0 100 --output /work/demo-files/rango.bin
+docker compose --profile tools run --rm client status
 ```
 
-## Inicio rápido
+`login demo` solicita la contraseña interactivamente. Consultar localmente `.secrets/credentials.txt` y escribir solo la contraseña. Crear la carpeta de salida antes de descargar; `demo.py` crea `demo-files`.
 
-Requiere Docker con Docker Compose. Todo se ejecuta desde la raíz del repositorio.
-
-La forma más rápida de verlo funcionar es la demostración completa:
-
-```bash
-./scripts/demo.sh
-```
-
-Levanta el clúster y ejecuta, en orden:
-
-1. Sube un archivo de 40 MB y lo descarga.
-2. Prueba la reserva de escritura.
-3. Apaga un DataNode y vuelve a descargar desde las réplicas.
-4. Agrega un cuarto DataNode en caliente.
-5. Compara las firmas SHA-256.
-
-### Paso a paso con Docker
-
-```bash
-docker compose up -d --build controlnode dn1 dn2 dn3
-curl http://localhost:8000/health        # debe reportar alive_datanodes: 3
-```
-
-El cliente corre como contenedor dentro de la red del clúster. Para no repetir las opciones, conviene un alias:
-
-```bash
-alias dfsha='docker compose --profile tools run --rm -e DFSHA_TOKEN=dfsha-dev-token -v "$PWD:/host" client'
-
-dfsha mkdir /demo
-dfsha put /host/archivo.bin /demo/archivo.bin
-dfsha ls /demo
-dfsha stat /demo/archivo.bin
-dfsha get /demo/archivo.bin /host/archivo-descargado.bin
-sha256sum archivo.bin archivo-descargado.bin
-```
-
-Tolerancia a fallos y escalado:
-
-```bash
-docker compose stop dn1
-sleep 10                                  # el ControlNode lo da por muerto a los 9 s
-dfsha get /demo/archivo.bin /host/sin-dn1.bin
-docker compose start dn1
-
-docker compose --profile scale up -d dn4  # agrega un DataNode sin reiniciar nada
-```
-
-Para apagar todo y borrar los datos: `docker compose --profile scale down -v`.
-
-### Sin Docker
-
-Requiere Go 1.23 o superior y Python 3.
-
-```bash
-go build -o controlnode ./cmd/controlnode && ./controlnode &
-go build -o datanode ./cmd/datanode
-NODE_ID=dn-01 PORT=8001 STORAGE_DIR=./dn1 ./datanode &
-NODE_ID=dn-02 PORT=8002 STORAGE_DIR=./dn2 ./datanode &
-NODE_ID=dn-03 PORT=8003 STORAGE_DIR=./dn3 ./datanode &
-
-python3 client/dfsha.py login demo demo
-python3 client/dfsha.py put archivo.bin /archivo.bin
-```
-
-### En varias máquinas (AWS Academy)
-
-Ver [`deploy/aws/README.md`](deploy/aws/README.md): un mismo `docker-compose.yml` para todas las VMs y un `.env` por VM.
-
-## Cliente
-
-| Comando | Qué hace |
+| Función | Sintaxis |
 |---|---|
-| `login <usuario> <contraseña>` | Autentica y guarda el token |
-| `ls [ruta]` | Lista un directorio |
-| `mkdir <ruta>` / `rmdir <ruta>` | Crea un directorio / borra uno vacío |
-| `rm <ruta>` | Borra un archivo |
-| `mv <origen> <destino>` | Renombra o mueve un archivo |
-| `stat <ruta>` | Tamaño, bloques, copias vivas y dueño |
-| `put <local> <remoto> [--workers N]` | Sube un archivo partido en bloques |
-| `get <remoto> <local> [--workers N]` | Descarga y reconstruye un archivo |
+| Transferencia | `put LOCAL REMOTO [--workers 4]`, `get REMOTO LOCAL [--workers 4]`; aliases `send`, `receive` |
+| Namespace | `ls [RUTA]`, `cd [RUTA]`, `mkdir`, `rmdir`, `rm`, `mv SRC DST`, `stat` |
+| Apertura | `open RUTA --mode r`, `open RUTA --mode w` |
+| Bloqueo y cierre | `lock RUTA` devuelve handle escritor; `close HANDLE` |
+| Rango | `read RUTA OFFSET LENGTH --output LOCAL [--handle HANDLE]` |
+| Escritura | `write HANDLE LOCAL --offset N [--workers 4]` |
 
-La dirección del ControlNode se indica con `--control` o con la variable `DFSHA_CONTROL` (por defecto `http://localhost:8000`).
+`write` aplica los bytes de LOCAL desde OFFSET sobre una copia de la versión remota y publica una versión nueva (copy-on-write). No modifica bloques existentes. Un lector abierto conserva su versión. Los handles duran 60 s y se renuevan durante accesos activos. Cada usuario tiene árbol privado: directorios 0700 y archivos 0600, comprobados en servidor. No hay ACL de compartición.
 
-### Credenciales de demostración
+Agregar usuario: `python scripts/setup.py --add-user --user estudiante`, y reiniciar controles para cargar `users.json`. En servicio utilizado, reiniciarlos uno por uno esperando reincorporación. Los certificados duran un año; `go run ./cmd/admin --renew-cert` reemite el certificado conservando claves de datos, con SAN personalizados en `--hosts`. Reiniciar nodos para cargarlo.
 
-| Valor | |
-|---|---|
-| Usuario / contraseña | `demo` / `demo` |
-| Token | `dfsha-dev-token` |
-| Clave interna del clúster | `dev-cluster-key` |
+## Arquitectura y garantías
 
-Son valores **solo de desarrollo**. La seguridad real (HTTPS, cifrado, usuarios) es del Hito 3.
+```mermaid
+flowchart LR
+ C[Cliente Python] -->|HTTPS planes| L[CN líder]
+ L <-->|Raft mTLS mayoría 2 de 3| F1[CN seguidor]
+ L <-->|Raft mTLS| F2[CN seguidor]
+ C <-->|binario HTTPS| D1[DN1]
+ C <-->|binario HTTPS| D2[DN2]
+ C <-->|binario HTTPS| D3[DN3]
+ D1 <-->|réplica y reparación| D2
+ D2 <-->|réplica y reparación| D3
+```
+
+Los bytes no atraviesan el ControlNode. El bloque usa `clamp(8 MiB, tamaño/(4*N), 64 MiB)`, redondeado a potencia de dos. Los archivos pequeños pueden ocupar un bloque replicado; el vacío conserva un bloque de tamaño cero por compatibilidad con Hito 2. Se ubican por menor ocupación con carga virtual y reserva de subidas activas. Se valida capacidad por destino bajo el umbral de 90 %.
+
+RF objetivo 2, limitado por N−1. Conforme al Hito 1 se permiten escrituras degradadas cuando faltan nodos: una sola copia no tolera su pérdida. Heartbeat DN 3 s, caída tras tres pérdidas (9 s), inventario 30 s y mantenimiento gradual. Un cuarto DN entra por registro dinámico.
+
+Un archivo aparece después de verificar con HEAD los hashes/tamaños de todas las copias del plan y confirmar su manifiesto por mayoría. Commit es idempotente por upload ID. El cliente verifica además el hash completo al descargar. Una respuesta perdida puede dejar resultado incierto: consultar/reintentar con el mismo identificador.
+
+Raft sustituye al matón modificado porque una elección por mayoría no define un registro seguro. HashiCorp Raft usa TCP/mTLS en 9000; las APIs históricas de elección/réplica son diagnóstico autenticado. Las lecturas requieren líder, mayoría y Barrier. Cada mutación lleva revisión CAS validada por la máquina de estados: una copia obsoleta no puede reemplazar metadatos confirmados. Sin dos controles no se aceptan operaciones autoritativas.
+
+Reparación y rebalanceo: copiar, verificar, confirmar mapa por mayoría y conservar la ubicación retirada al menos 120 s; antes de borrar se revalidan otras copias válidas. El GC protege handles vivos, pausa durante subidas y reinicia su gracia al cambiar líder.
+
+REST usa HTTPS con CA validada; Raft exige mTLS. Las sesiones HMAC expiran en una hora. Las capacidades de bloques se restringen por nodo, recurso y método; un token de sesión no permite acceso directo a bloques. AES-256-GCM usa nonce aleatorio por copia.
+
+El commit también verifica la autoría registrada por cada DN después de recibir un PUT válido de esa cuenta. Conocer un hash ajeno no basta para publicar ese contenido como propio. El registro de autoría persiste junto al almacenamiento y se limpia al eliminar físicamente el bloque.
 
 ## Configuración
 
-Los parámetros operativos se leen de variables de entorno, así que se cambian sin recompilar:
+`.env.example` ajusta parámetros sin secretos. Compose monta `.secrets` como archivos privados.
 
-```bash
-REPLICATION_FACTOR=1 BLOCK_SIZE_MIN_MB=4 docker compose up -d
+| Variable | Valor / propósito |
+|---|---|
+| `CLUSTER_KEY_FILE` | clave interna, mínimo 32 caracteres |
+| `SIGNING_KEY_FILE`, `ENCRYPTION_KEY_FILE` | 32 bytes expresados como 64 dígitos hex |
+| `TLS_CERT`, `TLS_KEY`, `TLS_CA`, `USERS_FILE` | certificado, clave, CA y mapa de hashes bcrypt |
+| `NODE_ID`, `CN_PEERS` | identidad estable; tres entradas `id@host:puertoRaft@https://host:puertoAPI` |
+| `RAFT_ADDR`, `RAFT_ADVERTISE`, `METADATA_DIR` | escucha, dirección anunciada y persistencia del control |
+| `DN_ADDR`, `ADVERTISE_URL`, `CONTROL_URLS`, `STORAGE_DIR` | escucha DN, URL alcanzable, controles y bloques |
+| `CAPACITY_BYTES` | cuota lógica 1 GiB por DN; debe caber en disco real |
+| `REPLICATION_FACTOR` | 2 |
+| `BLOCK_SIZE_MIN_MB`, `BLOCK_SIZE_MAX_MB`, `BLOCKS_PER_NODE` | 8, 64, 4; MB representa MiB |
+| `HEARTBEAT_MS`, `HEARTBEAT_MISSES`, `REPORT_MS` | 3000, 3, 30000 |
+| `WRITE_LEASE_SECONDS`, `MAINTENANCE_MS`, `GC_GRACE_SECONDS` | 60, 5000, 120; GC mínimo 120 |
+| `FULL_THRESHOLD_PERCENT`, `REBALANCE_THRESHOLD_PERCENT` | 90, 10 |
+| `DFSHA_CONTROLS`, `DFSHA_CA`, `DFSHA_SESSION` | controles, CA y archivo de sesión del cliente |
+
+Se admiten secretos por variables sin `_FILE`, pero se prefieren archivos. `DFSHA_INSECURE=true` habilita HTTP explícito para desarrollo; las evidencias de seguridad usan TLS real. Los tres votantes son fijos: no cambiar identidades/pares sobre volúmenes existentes como si fuera alta de DN.
+
+Puertos locales en 127.0.0.1: controles 8000/8010/8020, datos 8001/8011/8021. Las URLs anunciadas son internas de Compose. Una CLI nativa no resuelve los DNS de Docker automáticamente: usar el cliente de Compose o configurar despliegue multihost alcanzable.
+
+## Pruebas y fallos
+
+Para pruebas nativas instalar Go >=1.25 y Python >=3.10:
+
+```sh
+python scripts/build.py
+python scripts/test.py
+python scripts/integration_test.py --extended
 ```
 
-| Variable | Por defecto | Qué controla |
-|---|---|---|
-| `REPLICATION_FACTOR` | 2 | Copias de cada bloque (nunca más de N − 1 DataNodes) |
-| `BLOCK_SIZE_MIN_MB` | 8 | Piso del tamaño de bloque |
-| `BLOCK_SIZE_MAX_MB` | 64 | Techo del tamaño de bloque |
-| `BLOCKS_PER_NODE` | 4 | Bloques mínimos por nodo que debe producir un archivo |
-| `HEARTBEAT_INTERVAL_SECONDS` | 3 | Frecuencia del heartbeat de los DataNodes |
-| `HEARTBEAT_MISSES` | 3 | Heartbeats perdidos para dar por muerto un DataNode |
-| `WRITE_LEASE_TTL_SECONDS` | 60 | Vigencia de la reserva de escritura de un archivo |
+`--go RUTA` indica un Go fuera del PATH a build/test. Comandos separados: `go test ./...`, `go vet ./...`, `python -m unittest discover client -v`. La integración genera claves, puertos y almacenamiento temporales, ejecuta 3 CN y 3 DN, incorpora un cuarto DN y cierra sus procesos. No modifica los volúmenes Docker. La extendida espera renovación 20 s, vencimiento 60 s y gracia GC 120 s reales.
 
-## Pruebas
+Los [resultados finales](docs/resultados/integration.json) contienen checks, hashes, métricas 1/24 MiB con workers 1/4 y logs sanitizados. La [prueba prolongada](docs/resultados/integration-extended.json) registra renovación, expiración, eliminación real de huérfanos y convergencia a dos réplicas. [Docker](docs/resultados/docker.json) y [unitarias](docs/resultados/unit.json) tienen sus propios reportes. El CI Linux ejecuta Go/Python, valida Compose, realiza integración y conserva resultados.
 
-```bash
-go test ./...
-python3 -m unittest discover client
+```sh
+docker compose stop dn1
+# Ejecutar get: debe usar otra copia.
+docker compose start dn1
+docker compose stop cn1
+# Si era líder, esperar elección y ejecutar stat/get.
+docker compose start cn1
+docker compose --profile scale up -d dn4
+docker compose --profile tools run --rm client status
+docker compose logs --tail 60 cn1 cn2 cn3
 ```
+
+`docker compose stop` apaga y `start` reanuda conservando datos. `down` retira contenedores conservando volúmenes. **`down -v` borra los datos persistentes de ese proyecto**; solo sirve para reiniciar deliberadamente un laboratorio. No borrar `.secrets` si se conservan volúmenes.
+
+Para tres EC2: [deploy/aws/README.md](deploy/aws/README.md), con configuración por VM, puertos, SAN, grupos de seguridad y discos. No se ha aprovisionado AWS desde este entorno.
+
+El informe PDF se regenera desde su Markdown con `python -m pip install reportlab` y `python scripts/export_report.py`. ReportLab solo es una dependencia de autoría del informe; no se necesita para ejecutar DFSha.
+
+## Límites
+
+99,5 % es un objetivo, no disponibilidad anual medida. Se confía en nodos/administradores autenticados; no hay tolerancia bizantina. No se recuperan todas las copias válidas perdidas. Se replica el estado completo por mutación; hasta 100.000 bloques por manifiesto y JSON de 16 MiB limitan la escala académica. AES-GCM autentica un bloque completo y usa memoria por bloque/petición. No hay montaje POSIX, ACL compartidas, KMS, rotación de claves de datos en línea ni membresía dinámica de controles. Proteger y respaldar metadatos y secretos.
+
+La ejecución AWS Academy y grabación del video requieren sus respectivos entornos; se entregan procedimiento y guion sin presentarlos como ejecutados.

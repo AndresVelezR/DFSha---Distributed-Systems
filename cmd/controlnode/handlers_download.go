@@ -1,36 +1,61 @@
 package main
 
-import "net/http"
+import (
+	"dfsha/internal/common"
+	"encoding/json"
+	"net/http"
+	"time"
+)
 
-// downloadPlan devuelve, para cada bloque del archivo, las réplicas que están
-// en DataNodes vivos. El cliente descarga de la primera y, si falla, pasa a la
-// siguiente.
+func jsonMarshal(v any) (map[string]any, error) {
+	b, e := json.Marshal(v)
+	if e != nil {
+		return nil, e
+	}
+	var m map[string]any
+	e = json.Unmarshal(b, &m)
+	return m, e
+}
 func (s *Server) downloadPlan(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		methodNotAllowed(w)
+	p, ok := remote(w, r.URL.Query().Get("path"))
+	if !ok {
 		return
 	}
-	p := cleanRemote(r.URL.Query().Get("path"))
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	f, ok := s.files[p]
-	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]any{"error": "archivo no existe"})
+	u := owner(r)
+	v := s.state()
+	f := v.Files[key(u, p)]
+	if id := r.URL.Query().Get("handle"); id != "" {
+		h, e := handleFor(v, u, id, p, "r")
+		if e != nil {
+			fail(w, 410, e.Error())
+			return
+		}
+		h.ExpiresAt = time.Now().Add(s.cfg.WriteLeaseTTL)
+		if !s.persist(w, v) {
+			return
+		}
+		if h.File != nil {
+			f = h.File
+		}
+	}
+	if f == nil {
+		fail(w, 404, "archivo no existe")
 		return
 	}
 	blocks := []map[string]any{}
 	for _, b := range f.Blocks {
-		replicas := []Target{}
+		targets := []Target{}
 		for _, id := range b.StoredOn {
-			if n, ok := s.nodes[id]; ok && s.isAlive(n) {
-				replicas = append(replicas, Target{Node: n.NodeID, Host: n.Host, Port: n.Port})
+			n := s.nodes[id]
+			if n != nil && s.isAlive(n) {
+				targets = append(targets, Target{Node: id, URL: n.URL, Token: common.Sign(common.Claims{Kind: "block-read", User: u, Block: b.BlockID, Node: id, Exp: time.Now().Add(time.Minute).Unix()}, s.cfg.Security.SigningKey)})
 			}
 		}
-		if len(replicas) == 0 {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "bloque sin copias vivas", "block_id": b.BlockID})
+		if len(targets) == 0 {
+			fail(w, 503, "bloque sin réplicas vivas")
 			return
 		}
-		blocks = append(blocks, map[string]any{"index": b.Index, "block_id": b.BlockID, "size": b.Size, "replicas": replicas})
+		blocks = append(blocks, map[string]any{"index": b.Index, "block_id": b.BlockID, "size": b.Size, "targets": targets, "replicas": targets})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"path": p, "size": f.Size, "block_size": f.BlockSize, "blocks": blocks})
+	writeJSON(w, 200, map[string]any{"path": p, "size": f.Size, "sha256": f.SHA256, "block_size": f.BlockSize, "blocks": blocks})
 }

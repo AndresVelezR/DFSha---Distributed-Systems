@@ -1,0 +1,184 @@
+{
+  "status": "passed",
+  "go_unit_tests": 35,
+  "python_unit_tests": 31,
+  "go_vet": "passed",
+  "go_linux_container_tests": "passed",
+  "tests": [
+    {
+      "Package": "dfsha/internal/common",
+      "Test": "TestCapabilitiesDetectTamperingExpiryAndWrongKey",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/internal/common",
+      "Test": "TestIdentifiersDoNotAcceptPathsOrUppercase",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/internal/common",
+      "Test": "TestLoadConfigFailsClosedWithoutSecrets",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestStaleFullStateCannotEraseConfirmedOperation",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestRaftAdvertisedDNSRemainsStable",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestKnownHashDoesNotGrantAnotherAccountOwnership",
+      "Elapsed": 0.02
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestEncryptedStoreAndAtomicConcurrentRetry",
+      "Elapsed": 0.01
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestCapabilitiesScopeAndExpiry/missing",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestCapabilitiesScopeAndExpiry/wrong_node",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestCapabilitiesScopeAndExpiry/wrong_block",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestCapabilitiesScopeAndExpiry/write_cannot_read",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestCapabilitiesScopeAndExpiry/wildcard_cannot_read",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestCapabilitiesScopeAndExpiry/forged",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestCapabilitiesScopeAndExpiry/expired",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestUserNamespacesAndFileDirectoryCollision",
+      "Elapsed": 0.09
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestCapabilitiesScopeAndExpiry",
+      "Elapsed": 0.01
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestRangeAndHeadVerifyIntegrity",
+      "Elapsed": 0.05
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestWriteValidationAndCapacity",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestWriterLockAndReaderSnapshot",
+      "Elapsed": 0.08
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestIdempotentUploadAlwaysReplicates",
+      "Elapsed": 0.03
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestInternalReplicationAndInventory",
+      "Elapsed": 0.02
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestForwardRejectsUnsignedTargetAndReportsFailure",
+      "Elapsed": 0.01
+    },
+    {
+      "Package": "dfsha/cmd/datanode",
+      "Test": "TestReportsReachEveryControlAndTolerateFollower",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestMoveDirectoryAndRejectInvalidPaths",
+      "Elapsed": 0.08
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestUploadReservesPathAndExpiry",
+      "Elapsed": 0.09
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestIncompleteCommitInvisible",
+      "Elapsed": 0.06
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestCommitDoesNotTrustClientReplicaClaims",
+      "Elapsed": 0.06
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestFSMRoundTrip",
+      "Elapsed": 0.08
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestRetainedCopiesDoNotCauseRebalanceOscillation",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestChooseBlockSize",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestNumberOfBlocks",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestCopiesPerBlock",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestPlaceBlocksUsesDistinctNodesAndBalances",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestPlaceBlocksPrefersEmptierNode",
+      "Elapsed": 0
+    },
+    {
+      "Package": "dfsha/cmd/controlnode",
+      "Test": "TestFitsInCluster",
+      "Elapsed": 0
+    }
+  ]
+}

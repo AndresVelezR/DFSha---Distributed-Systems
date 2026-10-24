@@ -1,0 +1,42 @@
+name: DFSha tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.x'
+          cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Go unit tests and vet
+        run: |
+          go test ./...
+          go vet ./...
+      - name: Python client tests
+        run: python -m unittest discover client -v
+      - name: Validate Compose
+        run: docker compose --profile scale --profile tools config --quiet
+      - name: Build real processes
+        run: |
+          mkdir -p bin
+          go build -o bin/admin ./cmd/admin
+          go build -o bin/controlnode ./cmd/controlnode
+          go build -o bin/datanode ./cmd/datanode
+      - name: Integration, failures and metrics
+        run: python scripts/integration_test.py --output results/integration.json
+      - name: Preserve actual results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dfsha-integration-results
+          path: results/
+          if-no-files-found: ignore

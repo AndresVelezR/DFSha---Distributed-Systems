@@ -1,48 +1,72 @@
-// DataNode de DFSha: guarda bloques en su disco local, los entrega cuando se
-// los piden y propaga copias a otros DataNodes.
+// DataNode DFSha: almacenamiento de bloques autenticados e inmutables.
 package main
 
 import (
-	"fmt"
+	"context"
 	"log"
 	"net/http"
 	"os"
-	"time"
+	"path/filepath"
+	"strings"
+	"sync"
+
+	"dfsha/internal/common"
 )
 
-// Node es la configuración de este DataNode y de a quién le habla.
+const maxBlockSize int64 = 64 * 1024 * 1024
+
 type Node struct {
-	ID                string
-	Host              string // dirección con la que otros nodos y el cliente lo alcanzan
-	Port              int
-	ControlURL        string
-	StorageDir        string
-	ClusterKey        string
-	ClientToken       string
-	HeartbeatInterval time.Duration
+	ID          string
+	URL         string
+	Addr        string
+	ControlURLs []string
+	StorageDir  string
+	Capacity    int64
+	Config      common.Config
+	Client      *http.Client
+	storageMu   sync.Mutex
+}
+
+type blockInfo struct {
+	BlockID string `json:"block_id"`
+	Size    int64  `json:"size"`
+}
+
+type forwardTarget struct {
+	Node  string `json:"node"`
+	URL   string `json:"url"`
+	Token string `json:"token,omitempty"`
 }
 
 func main() {
 	n, err := loadNode()
 	if err != nil {
-		log.Fatalf("configuración inválida: %v", err)
-	}
-	if err := os.MkdirAll(n.StorageDir, 0755); err != nil {
 		log.Fatal(err)
 	}
-	if err := n.register(); err != nil {
-		log.Printf("registro inicial falló: %v (se reintentará)", err)
+	if err := os.MkdirAll(n.StorageDir, 0700); err != nil {
+		log.Fatal(err)
 	}
-	go n.heartbeatLoop()
-
-	addr := fmt.Sprintf(":%d", n.Port)
-	log.Printf("DataNode %s escuchando en %s, almacenamiento=%s, heartbeat cada %s", n.ID, addr, n.StorageDir, n.HeartbeatInterval)
-	log.Fatal(http.ListenAndServe(addr, n.routes()))
+	entries, err := os.ReadDir(n.StorageDir)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// Temporales de procesos anteriores nunca se anuncian como bloques.
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasPrefix(e.Name(), ".block-") {
+			if err := os.Remove(filepath.Join(n.StorageDir, e.Name())); err != nil {
+				log.Printf("limpiar temporal: %v", err)
+			}
+		}
+	}
+	go n.controlLoop(context.Background())
+	log.Printf("DataNode %s en %s, almacenamiento=%s, capacidad=%d", n.ID, n.Addr, n.StorageDir, n.Capacity)
+	log.Fatal(common.Serve(n.Addr, n.routes(), n.Config))
 }
 
 func (n *Node) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", n.health)
+	mux.HandleFunc("/inventory", n.inventory)
 	mux.HandleFunc("/blocks/", n.blocks)
 	return mux
 }

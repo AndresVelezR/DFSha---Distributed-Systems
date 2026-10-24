@@ -1,33 +1,36 @@
 package main
 
 import (
-	"encoding/json"
+	"dfsha/internal/common"
+	"golang.org/x/crypto/bcrypt"
 	"net/http"
+	"time"
 )
 
-// login valida usuario y contraseña y entrega el token. En este hito hay un
-// único usuario de demostración; el control de acceso real llega en el Hito 3.
 func (s *Server) login(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		methodNotAllowed(w)
+	var q struct{ Username, Password string }
+	if !decode(w, r, &q) {
 		return
 	}
-	var req struct{ Username, Password string }
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		badRequest(w, err)
+	hash := s.users[q.Username]
+	if hash == "" {
+		hash = "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+	}
+	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(q.Password)) != nil || s.users[q.Username] == "" {
+		fail(w, 401, "credenciales inválidas")
 		return
 	}
-	if req.Username != demoUser || req.Password != demoPassword {
-		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "credenciales inválidas"})
+	s.op.Lock()
+	defer s.op.Unlock()
+	if !s.leader(w) {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"token": demoToken, "expires_in": 3600})
+	v := s.state()
+	if !v.Dirs[key(q.Username, "/")] {
+		v.Dirs[key(q.Username, "/")] = true
+		if !s.persist(w, v) {
+			return
+		}
+	}
+	common.JSON(w, 200, map[string]any{"token": common.Sign(common.Claims{Kind: "session", User: q.Username, Exp: time.Now().Add(time.Hour).Unix()}, s.cfg.Security.SigningKey), "expires_in": 3600})
 }
-
-// Credenciales de demostración de este hito. No son configurables a propósito:
-// se reemplazan por usuarios reales y tokens firmados en el Hito 3.
-const (
-	demoUser     = "demo"
-	demoPassword = "demo"
-	demoToken    = "dfsha-dev-token"
-)

@@ -1,22 +1,29 @@
-// ControlNode de DFSha: guarda los metadatos del sistema de archivos, sabe
-// qué DataNodes están vivos y calcula los planes de lectura y escritura.
-// Nunca recibe los datos de los archivos.
 package main
 
 import (
+	"dfsha/internal/common"
+	"encoding/json"
 	"log"
-	"net/http"
+	"os"
 )
 
 func main() {
-	cfg, err := loadConfig()
-	if err != nil {
-		log.Fatalf("configuración inválida: %v", err)
+	cfg, e := loadConfig()
+	if e != nil {
+		log.Fatal(e)
 	}
 	s := newServer(cfg)
-	log.Printf("ControlNode %s escuchando en %s (replication_factor=%d, bloque=%d-%d MB, k=%d, nodo muerto tras %s)",
-		cfg.NodeID, cfg.Addr, cfg.ReplicationFactor,
-		cfg.BlockSizing.Min/megabyte, cfg.BlockSizing.Max/megabyte, cfg.BlockSizing.BlocksPerNode,
-		cfg.HeartbeatTimeout())
-	log.Fatal(http.ListenAndServe(cfg.Addr, s.routes()))
+	b, e := os.ReadFile(cfg.UsersFile)
+	if e != nil {
+		log.Fatal(e)
+	}
+	if e = json.Unmarshal(b, &s.users); e != nil || len(s.users) == 0 {
+		log.Fatal("users.json inválido o vacío")
+	}
+	if e = s.startRaft(); e != nil {
+		log.Fatal(e)
+	}
+	go s.maintenanceLoop()
+	log.Printf("ControlNode %s en %s", cfg.NodeID, cfg.Addr)
+	log.Fatal(common.Serve(cfg.Addr, s.routes(), cfg.Security))
 }

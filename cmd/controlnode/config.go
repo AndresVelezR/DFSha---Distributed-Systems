@@ -1,105 +1,55 @@
 package main
 
 import (
+	"dfsha/internal/common"
 	"fmt"
 	"os"
 	"strconv"
 	"time"
 )
 
-// Config reúne los parámetros operativos del ControlNode (Hito 1, "Parámetros
-// configurables"). Se leen de variables de entorno al arrancar, así que se
-// cambian sin recompilar. Los valores por defecto son los del Hito 1.
+const megabyte = 1024 * 1024
+
+type BlockSizing struct{ Min, Max, BlocksPerNode int64 }
 type Config struct {
-	Addr              string        // CN_ADDR
-	NodeID            string        // NODE_ID
-	ClusterKey        string        // CLUSTER_KEY
-	ReplicationFactor int           // REPLICATION_FACTOR
-	BlockSizing       BlockSizing   // BLOCK_SIZE_MIN_MB, BLOCK_SIZE_MAX_MB, BLOCKS_PER_NODE
-	HeartbeatInterval time.Duration // HEARTBEAT_INTERVAL_SECONDS
-	HeartbeatMisses   int           // HEARTBEAT_MISSES
-	WriteLeaseTTL     time.Duration // WRITE_LEASE_TTL_SECONDS
+	Addr, NodeID, DataDir, RaftAddr, RaftAdvertise, Peers, UsersFile string
+	Security                                                         common.Config
+	ReplicationFactor                                                int
+	BlockSizing                                                      BlockSizing
+	HeartbeatInterval                                                time.Duration
+	HeartbeatMisses                                                  int
+	WriteLeaseTTL, MaintenanceInterval, GCGrace                      time.Duration
+	FullThreshold, RebalanceThreshold                                float64
 }
 
-// BlockSizing son los parámetros de la fórmula de tamaño de bloque [N3].
-type BlockSizing struct {
-	Min           int64 // piso del tamaño de bloque, en bytes
-	Max           int64 // techo del tamaño de bloque, en bytes
-	BlocksPerNode int64 // k: bloques mínimos por nodo que debe producir un archivo
-}
-
-// HeartbeatTimeout es cuánto tiempo sin heartbeat hace falta para dar por
-// muerto a un DataNode: heartbeat_interval x heartbeat_misses [N9].
 func (c Config) HeartbeatTimeout() time.Duration {
 	return c.HeartbeatInterval * time.Duration(c.HeartbeatMisses)
 }
-
-const megabyte = 1024 * 1024
-
+func getenv(k, d string) string { return common.Env(k, d) }
+func envInt(k string, d int) int {
+	v, e := strconv.Atoi(getenv(k, strconv.Itoa(d)))
+	if e != nil || v < 1 {
+		panic(fmt.Sprintf("%s entero positivo obligatorio", k))
+	}
+	return v
+}
 func loadConfig() (Config, error) {
-	var errs []error
-	intVar := func(key string, def int) int {
-		v, err := getenvInt(key, def)
-		if err != nil {
-			errs = append(errs, err)
-		}
-		return v
+	sec, e := common.LoadConfig()
+	if e != nil {
+		return Config{}, e
 	}
-	cfg := Config{
-		Addr:              getenv("CN_ADDR", ":8000"),
-		NodeID:            getenv("NODE_ID", "cn-01"),
-		ClusterKey:        getenv("CLUSTER_KEY", "dev-cluster-key"),
-		ReplicationFactor: intVar("REPLICATION_FACTOR", 2),
-		BlockSizing: BlockSizing{
-			Min:           int64(intVar("BLOCK_SIZE_MIN_MB", 8)) * megabyte,
-			Max:           int64(intVar("BLOCK_SIZE_MAX_MB", 64)) * megabyte,
-			BlocksPerNode: int64(intVar("BLOCKS_PER_NODE", 4)),
-		},
-		HeartbeatInterval: time.Duration(intVar("HEARTBEAT_INTERVAL_SECONDS", 3)) * time.Second,
-		HeartbeatMisses:   intVar("HEARTBEAT_MISSES", 3),
-		WriteLeaseTTL:     time.Duration(intVar("WRITE_LEASE_TTL_SECONDS", 60)) * time.Second,
+	c := Config{Addr: getenv("CN_ADDR", ":8000"), NodeID: getenv("NODE_ID", "cn-01"), DataDir: getenv("METADATA_DIR", "data/control"), RaftAddr: getenv("RAFT_ADDR", ":9000"), RaftAdvertise: getenv("RAFT_ADVERTISE", "localhost:9000"), Peers: getenv("CN_PEERS", "cn-01@localhost:9000@https://localhost:8000"), UsersFile: getenv("USERS_FILE", ".secrets/users.json"), Security: sec, ReplicationFactor: envInt("REPLICATION_FACTOR", 2), BlockSizing: BlockSizing{int64(envInt("BLOCK_SIZE_MIN_MB", 8)) * megabyte, int64(envInt("BLOCK_SIZE_MAX_MB", 64)) * megabyte, int64(envInt("BLOCKS_PER_NODE", 4))}, HeartbeatInterval: time.Duration(envInt("HEARTBEAT_MS", 3000)) * time.Millisecond, HeartbeatMisses: envInt("HEARTBEAT_MISSES", 3), WriteLeaseTTL: time.Duration(envInt("WRITE_LEASE_SECONDS", 60)) * time.Second, MaintenanceInterval: time.Duration(envInt("MAINTENANCE_MS", 5000)) * time.Millisecond, GCGrace: time.Duration(envInt("GC_GRACE_SECONDS", 120)) * time.Second, FullThreshold: float64(envInt("FULL_THRESHOLD_PERCENT", 90)) / 100, RebalanceThreshold: float64(envInt("REBALANCE_THRESHOLD_PERCENT", 10)) / 100}
+	if c.BlockSizing.Min < 8*megabyte || c.BlockSizing.Max > 64*megabyte || c.BlockSizing.Max < c.BlockSizing.Min {
+		return c, fmt.Errorf("bloques deben estar entre8 y64 MiB")
 	}
-	if len(errs) > 0 {
-		return cfg, errs[0]
+	if c.FullThreshold > 1 || c.RebalanceThreshold > 1 {
+		return c, fmt.Errorf("umbrales <=100")
 	}
-	return cfg, cfg.validate()
-}
-
-func (c Config) validate() error {
-	switch {
-	case c.ReplicationFactor < 1:
-		return fmt.Errorf("REPLICATION_FACTOR debe ser al menos 1")
-	case c.BlockSizing.Min < 1:
-		return fmt.Errorf("BLOCK_SIZE_MIN_MB debe ser al menos 1")
-	case c.BlockSizing.Max < c.BlockSizing.Min:
-		return fmt.Errorf("BLOCK_SIZE_MAX_MB no puede ser menor que BLOCK_SIZE_MIN_MB")
-	case c.BlockSizing.BlocksPerNode < 1:
-		return fmt.Errorf("BLOCKS_PER_NODE debe ser al menos 1")
-	case c.HeartbeatInterval < time.Second:
-		return fmt.Errorf("HEARTBEAT_INTERVAL_SECONDS debe ser al menos 1")
-	case c.HeartbeatMisses < 1:
-		return fmt.Errorf("HEARTBEAT_MISSES debe ser al menos 1")
-	case c.WriteLeaseTTL < time.Second:
-		return fmt.Errorf("WRITE_LEASE_TTL_SECONDS debe ser al menos 1")
+	if c.GCGrace < time.Minute*2 {
+		return c, fmt.Errorf("GC_GRACE_SECONDS mínimo120 protege capacidades pendientes")
 	}
-	return nil
-}
-
-func getenv(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
+	if _, e = os.Stat(c.UsersFile); e != nil {
+		return c, e
 	}
-	return def
-}
-
-func getenvInt(key string, def int) (int, error) {
-	raw := os.Getenv(key)
-	if raw == "" {
-		return def, nil
-	}
-	v, err := strconv.Atoi(raw)
-	if err != nil {
-		return def, fmt.Errorf("%s=%q no es un entero", key, raw)
-	}
-	return v, nil
+	return c, nil
 }

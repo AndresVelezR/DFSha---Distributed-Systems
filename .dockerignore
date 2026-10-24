@@ -1,5 +1,14 @@
 .git
-docs
+.secrets
+.env
+.tools
+bin
+data
+results
 demo-files
+__pycache__
 **/__pycache__
-**/*.pyc
+*.zip
+*.pdf
+*.pyc
+docs
