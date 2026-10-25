@@ -1,4 +1,5 @@
-// Package common contains the shared wire security and TLS configuration.
+// Package common reúne lo que comparten ControlNode y DataNode: secretos,
+// TLS, el cliente HTTP y los permisos firmados (tokens) con HMAC.
 package common
 
 import (
@@ -12,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -49,7 +51,7 @@ func LoadConfig() (Config, error) {
 		return c, e
 	}
 	if len(c.ClusterKey) < 32 {
-		return c, errors.New("CLUSTER_KEY mínimo32 caracteres")
+		return c, errors.New("CLUSTER_KEY debe tener al menos 32 caracteres")
 	}
 	for _, p := range []struct {
 		k   string
@@ -61,7 +63,7 @@ func LoadConfig() (Config, error) {
 		}
 		*p.out, err = hex.DecodeString(s)
 		if err != nil || len(*p.out) != 32 {
-			return c, fmt.Errorf("%s debe tener64 dígitos hex", p.k)
+			return c, fmt.Errorf("%s debe tener 64 dígitos hexadecimales", p.k)
 		}
 	}
 	if !c.Insecure {
@@ -90,8 +92,13 @@ func TLSConfig(c Config, server, mutual bool) (*tls.Config, error) {
 	}
 	return cfg, nil
 }
+
+// HTTPClient es el cliente para hablar con otros nodos. Verifica el
+// certificado con la CA del clúster y no espera más de 5 s para conectar,
+// para que una máquina apagada se detecte rápido en vez de colgar al nodo.
 func HTTPClient(c Config) *http.Client {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DialContext = (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext
 	if !c.Insecure {
 		tr.TLSClientConfig, _ = TLSConfig(c, false, false)
 	}

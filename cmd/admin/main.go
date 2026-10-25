@@ -12,7 +12,6 @@ import (
 	"encoding/pem"
 	"flag"
 	"fmt"
-	"golang.org/x/crypto/bcrypt"
 	"math/big"
 	"net"
 	"os"
@@ -20,6 +19,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"golang.org/x/crypto/bcrypt"
 )
 
 func must(e error) {
@@ -64,7 +65,7 @@ func main() {
 		password = strings.TrimSpace(string(b))
 	}
 	if len(password) < 12 || len(password) > 72 {
-		must(fmt.Errorf("contraseña entre12 y72 bytes"))
+		must(fmt.Errorf("la contraseña debe tener entre 12 y 72 bytes"))
 	}
 	users := map[string]string{}
 	if *add {
