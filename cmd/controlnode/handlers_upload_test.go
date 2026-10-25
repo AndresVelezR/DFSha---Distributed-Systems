@@ -1,15 +1,16 @@
 package main
 
 import (
-	"context"
-	"dfsha/internal/common"
 	"encoding/json"
-	"github.com/hashicorp/raft"
 	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
+
+	"dfsha/internal/common"
+
+	"github.com/hashicorp/raft"
 )
 
 func newTestServer(t *testing.T, datanodes int) *Server {
@@ -121,5 +122,3 @@ func TestFSMRoundTrip(t *testing.T) {
 		t.Fatal("lost metadata")
 	}
 }
-
-var _ = context.Background

@@ -1,10 +1,11 @@
 package main
 
 import (
-	"dfsha/internal/common"
 	"encoding/json"
 	"log"
 	"os"
+
+	"dfsha/internal/common"
 )
 
 func main() {

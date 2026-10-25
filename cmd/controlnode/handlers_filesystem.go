@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"path"
@@ -264,14 +265,23 @@ func (s *Server) fsStat(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "archivo no existe")
 		return
 	}
-	b, _ := commonMap(f)
+	b, _ := toMap(f)
 	b["type"] = "file"
 	b["mode"] = "0600"
 	b["n_blocks"] = len(f.Blocks)
 	b["replicas_ok"] = s.liveReplicas(f.Blocks)
 	writeJSON(w, 200, b)
 }
-func commonMap(v any) (map[string]any, error)                     { b, e := jsonMarshal(v); return b, e }
+func toMap(v any) (map[string]any, error) {
+	b, e := json.Marshal(v)
+	if e != nil {
+		return nil, e
+	}
+	var m map[string]any
+	e = json.Unmarshal(b, &m)
+	return m, e
+}
+
 func (s *Server) openFile(w http.ResponseWriter, r *http.Request) { s.doOpen(w, r, false) }
 func (s *Server) lockFile(w http.ResponseWriter, r *http.Request) { s.doOpen(w, r, true) }
 func (s *Server) doOpen(w http.ResponseWriter, r *http.Request, lock bool) {

@@ -1,13 +1,13 @@
 package main
 
 import (
-	"github.com/hashicorp/raft"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 )
 
+// health es público: dice qué rol tiene este ControlNode y quién es el líder.
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	s.op.Lock()
 	defer s.op.Unlock()
@@ -28,6 +28,9 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]any{"nodes": nodes, "files": files, "raft": s.raft.Stats(), "replication_factor": s.cfg.ReplicationFactor})
 }
+
+// clusterRegister da de alta un DataNode o actualiza su ocupación. Un nodo
+// nuevo solo tiene que arrancar y llamar aquí: así crece el clúster.
 func (s *Server) clusterRegister(w http.ResponseWriter, r *http.Request) {
 	var q NodeInfo
 	if !decode(w, r, &q) {
@@ -49,6 +52,10 @@ func (s *Server) clusterRegister(w http.ResponseWriter, r *http.Request) {
 	s.nodes[q.NodeID] = &q
 	writeJSON(w, 201, map[string]any{"status": "registered", "node_id": q.NodeID})
 }
+
+// clusterHeartbeat es la señal de vida periódica. Lleva los mismos datos que
+// el registro, así que un líder recién elegido conoce al nodo con el primer
+// heartbeat que recibe.
 func (s *Server) clusterHeartbeat(w http.ResponseWriter, r *http.Request) { s.clusterRegister(w, r) }
 func (s *Server) clusterBlockReport(w http.ResponseWriter, r *http.Request) {
 	var q struct {
@@ -72,8 +79,3 @@ func (s *Server) clusterBlockReport(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, map[string]int{"accepted": len(n.Blocks)})
 }
-func (s *Server) raftProtocol(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"protocol": "Raft TCP con mTLS", "role": s.raft.State().String(), "term": s.raft.Stats()["term"], "note": "endpoint diagnóstico; elecciones y log se procesan en RAFT_ADDR"})
-}
-
-var _ = raft.Leader

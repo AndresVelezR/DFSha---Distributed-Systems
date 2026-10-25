@@ -65,13 +65,34 @@ func TestCopiesPerBlock(t *testing.T) {
 	}
 }
 
+func TestBlockSizes(t *testing.T) {
+	got := blockSizes(20, 8)
+	if len(got) != 3 || got[0] != 8 || got[1] != 8 || got[2] != 4 {
+		t.Errorf("blockSizes(20, 8) = %v, se esperaba [8 8 4]", got)
+	}
+	if empty := blockSizes(0, 8); len(empty) != 1 || empty[0] != 0 {
+		t.Errorf("un archivo vacío debe tener un bloque de 0 bytes, se obtuvo %v", empty)
+	}
+}
+
+func equalSizes(n int, size int64) []int64 {
+	sizes := make([]int64, n)
+	for i := range sizes {
+		sizes[i] = size
+	}
+	return sizes
+}
+
 func TestPlaceBlocksUsesDistinctNodesAndBalances(t *testing.T) {
 	nodes := []*NodeInfo{
 		{NodeID: "dn-01", Capacity: 1000 * megabyte},
 		{NodeID: "dn-02", Capacity: 1000 * megabyte},
 		{NodeID: "dn-03", Capacity: 1000 * megabyte},
 	}
-	plans := placeBlocks(nodes, 6, 8*megabyte, 2)
+	plans, ok := placeBlocks(nodes, equalSizes(6, 8*megabyte), 2, 0.9)
+	if !ok {
+		t.Fatal("el plan debía caber")
+	}
 
 	perNode := map[string]int{}
 	for _, p := range plans {
@@ -95,25 +116,26 @@ func TestPlaceBlocksUsesDistinctNodesAndBalances(t *testing.T) {
 
 func TestPlaceBlocksPrefersEmptierNode(t *testing.T) {
 	nodes := []*NodeInfo{
-		{NodeID: "dn-01", Capacity: 100, Used: 90},
+		{NodeID: "dn-01", Capacity: 100, Used: 80},
 		{NodeID: "dn-02", Capacity: 100, Used: 10},
 		{NodeID: "dn-03", Capacity: 100, Used: 50},
 	}
-	plans := placeBlocks(nodes, 1, 1, 1)
+	plans, _ := placeBlocks(nodes, []int64{1}, 1, 0.9)
 	if got := plans[0].Targets[0].Node; got != "dn-02" {
 		t.Errorf("el bloque fue a %s, se esperaba el nodo más vacío dn-02", got)
 	}
 }
 
-func TestFitsInCluster(t *testing.T) {
+func TestPlaceBlocksRespectsFullThreshold(t *testing.T) {
 	nodes := []*NodeInfo{
-		{NodeID: "dn-01", Capacity: 100, Used: 60}, // 40 libres
-		{NodeID: "dn-02", Capacity: 100, Used: 40}, // 60 libres
+		{NodeID: "dn-01", Capacity: 100, Used: 60},
+		{NodeID: "dn-02", Capacity: 100, Used: 40},
 	}
-	if !fitsInCluster(nodes, 50, 2) {
-		t.Error("50 bytes x 2 copias = 100 deberían caber en 100 libres")
+	// Con umbral del 90 %, dn-01 admite 30 y dn-02 admite 50.
+	if _, ok := placeBlocks(nodes, []int64{30}, 2, 0.9); !ok {
+		t.Error("30 bytes con 2 copias deberían caber")
 	}
-	if fitsInCluster(nodes, 51, 2) {
-		t.Error("51 bytes x 2 copias = 102 no deberían caber en 100 libres")
+	if _, ok := placeBlocks(nodes, []int64{31}, 2, 0.9); ok {
+		t.Error("31 bytes con 2 copias pasan el umbral de dn-01 y no deberían caber")
 	}
 }

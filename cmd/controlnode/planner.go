@@ -36,6 +36,16 @@ func numberOfBlocks(size, blockSize int64) int {
 	return int((size + blockSize - 1) / blockSize)
 }
 
+// blockSizes devuelve el tamaño de cada bloque: todos miden blockSize salvo
+// el último, que lleva el resto.
+func blockSizes(size, blockSize int64) []int64 {
+	sizes := make([]int64, numberOfBlocks(size, blockSize))
+	for i := range sizes {
+		sizes[i] = min(blockSize, size-int64(i)*blockSize)
+	}
+	return sizes
+}
+
 // copiesPerBlock decide cuántas copias lleva cada bloque, según el Hito 1 [N4]:
 //   - target: el factor configurado, pero nunca mayor que registered-1 (N-1),
 //     para que siempre exista un DataNode donde rehacer una copia perdida.
@@ -51,25 +61,18 @@ func copiesPerBlock(configured, registered, alive int) (target, copies int) {
 	return target, copies
 }
 
-// fitsInCluster dice si un archivo de size bytes, guardado con copies copias,
-// cabe en el espacio libre sumado de los DataNodes vivos. Así una carga que no
-// cabe se rechaza de entrada en vez de fallar a mitad de camino [Hito 1,
-// "Sobre el tamaño máximo de archivo"].
-func fitsInCluster(nodes []*NodeInfo, size int64, copies int) bool {
-	var free int64
-	for _, n := range nodes {
-		free += max(n.Capacity-n.Used, 0)
-	}
-	return size*int64(copies) <= free
-}
-
 // placeBlocks asigna destinos a cada bloque con la heurística voraz del
-// Hito 1 [N5]: cada copia va al DataNode con menor ocupación relativa.
+// Hito 1 [N5]: cada copia va al DataNode con menor ocupación relativa que
+// todavía quede por debajo de fullThreshold después de recibirla.
+//
 // La ocupación se actualiza mientras se arma el plan ("carga virtual") para
 // que los bloques de una misma subida no caigan todos en los mismos nodos.
-// Las copias de un mismo bloque siempre quedan en DataNodes distintos.
-// Los empates se resuelven por node_id para que el plan sea reproducible.
-func placeBlocks(nodes []*NodeInfo, nBlocks int, blockSize int64, copies int) []BlockPlan {
+// Las copias de un mismo bloque siempre quedan en DataNodes distintos y los
+// empates se resuelven por node_id para que el plan sea reproducible.
+//
+// Devuelve false si algún bloque no consigue todas sus copias: el archivo no
+// cabe y se rechaza antes de empezar a subirlo.
+func placeBlocks(nodes []*NodeInfo, sizes []int64, copies int, fullThreshold float64) ([]BlockPlan, bool) {
 	used := make(map[string]int64, len(nodes))
 	for _, n := range nodes {
 		used[n.NodeID] = n.Used
@@ -78,8 +81,8 @@ func placeBlocks(nodes []*NodeInfo, nBlocks int, blockSize int64, copies int) []
 		return float64(used[n.NodeID]) / float64(max(n.Capacity, 1))
 	}
 
-	plans := make([]BlockPlan, nBlocks)
-	for i := range plans {
+	plans := make([]BlockPlan, len(sizes))
+	for i, size := range sizes {
 		candidates := append([]*NodeInfo(nil), nodes...)
 		sort.Slice(candidates, func(a, b int) bool {
 			oa, ob := occupancy(candidates[a]), occupancy(candidates[b])
@@ -89,11 +92,20 @@ func placeBlocks(nodes []*NodeInfo, nBlocks int, blockSize int64, copies int) []
 			return candidates[a].NodeID < candidates[b].NodeID
 		})
 		targets := make([]Target, 0, copies)
-		for _, n := range candidates[:copies] {
-			targets = append(targets, Target{Node: n.NodeID, Host: n.Host, Port: n.Port})
-			used[n.NodeID] += blockSize
+		for _, n := range candidates {
+			if float64(used[n.NodeID]+size) > float64(n.Capacity)*fullThreshold {
+				continue
+			}
+			targets = append(targets, Target{Node: n.NodeID, URL: n.URL})
+			used[n.NodeID] += size
+			if len(targets) == copies {
+				break
+			}
+		}
+		if len(targets) < copies {
+			return nil, false
 		}
 		plans[i] = BlockPlan{Index: i, Targets: targets}
 	}
-	return plans
+	return plans, true
 }

@@ -3,29 +3,102 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/hashicorp/raft"
 	"log"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/raft"
 )
 
-func (s *Server) internal(method, url string, body any) (*http.Response, error) {
-	var b bytes.Buffer
-	if body != nil {
-		_ = json.NewEncoder(&b).Encode(body)
+// Mantenimiento: cada MAINTENANCE_MS el líder revisa el clúster en este orden.
+//  1. Vence reservas de subida y handles abandonados.
+//  2. Pide a cada DataNode vivo su inventario real de bloques.
+//  3. Repara: si un bloque tiene menos copias que las deseadas, copia uno
+//     entre DataNodes. Si tiene de más, retira las sobrantes.
+//  4. Rebalancea: si la ocupación entre el nodo más lleno y el más vacío
+//     difiere más que REBALANCE_THRESHOLD_PERCENT, mueve un bloque.
+//  5. Publica el mapa nuevo por Raft y solo después borra copias retiradas
+//     y bloques huérfanos que ya cumplieron GC_GRACE_SECONDS.
+//
+// Cada pasada mueve como máximo un bloque, para acotar el tráfico de fondo.
+
+func (s *Server) maintenanceLoop() {
+	tick := time.NewTicker(s.cfg.MaintenanceInterval)
+	defer tick.Stop()
+	for range tick.C {
+		s.op.Lock()
+		if s.raft.State() == raft.Leader && s.raft.VerifyLeader().Error() == nil && s.raft.Barrier(3*time.Second).Error() == nil {
+			s.maintain()
+		}
+		s.op.Unlock()
 	}
-	req, e := http.NewRequest(method, url, &b)
-	if e != nil {
-		return nil, e
-	}
-	req.Header.Set("X-Cluster-Key", s.cfg.Security.ClusterKey)
-	req.Header.Set("Content-Type", "application/json")
-	return s.client.Do(req)
 }
+
+func (s *Server) maintain() {
+	v := s.state()
+	changed, uploading := expireLeases(v, time.Now())
+	nodes := s.refreshInventories()
+	desired, _ := copiesPerBlock(s.cfg.ReplicationFactor, len(s.nodes), len(nodes))
+	desired = min(desired, len(nodes))
+
+	repaired, moved := s.repairReplicas(v, nodes, desired, uploading)
+	changed = changed || repaired
+	if !moved && !uploading && s.rebalanceOne(v, nodes, desired) {
+		changed = true
+	}
+	if changed {
+		if e := s.save(v); e != nil {
+			log.Printf("mantenimiento: no se pudo publicar el mapa: %v", e)
+			return
+		}
+	}
+	// Mientras haya una subida en curso no se conocen todavía sus bloques,
+	// así que no se borra nada: podría parecer basura un bloque recién subido.
+	if uploading {
+		return
+	}
+	refs := referencedBlocks(v)
+	s.deleteRetired(refs, nodes, desired)
+	s.collectOrphans(refs, nodes)
+}
+
+// expireLeases borra reservas y handles vencidos. Devuelve si cambió el
+// estado y si queda alguna subida en curso.
+func expireLeases(v *State, now time.Time) (changed, uploading bool) {
+	for id, up := range v.Uploads {
+		if now.After(up.ExpiresAt) {
+			delete(v.Uploads, id)
+			changed = true
+		} else {
+			uploading = true
+		}
+	}
+	for id, h := range v.Handles {
+		if now.After(h.ExpiresAt) {
+			delete(v.Handles, id)
+			changed = true
+		}
+	}
+	return changed, uploading
+}
+
+// refreshInventories consulta el inventario de los DataNodes vivos y devuelve
+// los que respondieron. Solo sobre ellos se toman decisiones de copia.
+func (s *Server) refreshInventories() []*NodeInfo {
+	verified := []*NodeInfo{}
+	for _, alive := range s.aliveNodes() {
+		n := s.nodes[alive.NodeID]
+		if s.inventory(n) {
+			verified = append(verified, n)
+		}
+	}
+	return verified
+}
+
 func (s *Server) inventory(n *NodeInfo) bool {
-	resp, e := s.internal("GET", n.URL+"/inventory", nil)
+	resp, e := s.internal(s.quickClient, "GET", n.URL+"/inventory", nil, nil)
 	if e != nil {
 		return false
 	}
@@ -39,7 +112,7 @@ func (s *Server) inventory(n *NodeInfo) bool {
 		Blocks   []struct {
 			BlockID string `json:"block_id"`
 			Size    int64  `json:"size"`
-		}
+		} `json:"blocks"`
 	}
 	if json.NewDecoder(resp.Body).Decode(&q) != nil {
 		return false
@@ -52,43 +125,15 @@ func (s *Server) inventory(n *NodeInfo) bool {
 	n.Capacity = q.Capacity
 	return true
 }
-func (s *Server) copyBlock(src, dst *NodeInfo, b StoredBlock) bool {
-	resp, e := s.internal("POST", src.URL+"/blocks/"+b.BlockID+"/replicate", map[string]any{"target": Target{Node: dst.NodeID, URL: dst.URL}})
-	if e != nil {
-		return false
-	}
-	resp.Body.Close()
-	if resp.StatusCode >= 300 || !s.verifyBlock(dst, b) {
-		return false
-	}
-	if dst.Blocks == nil {
-		dst.Blocks = map[string]int64{}
-	}
-	dst.Blocks[b.BlockID] = b.Size
-	dst.Used += b.Size + 32
-	return true
-}
-func sameIDs(a, b []string) bool {
-	x := append([]string{}, a...)
-	y := append([]string{}, b...)
-	sort.Strings(x)
-	sort.Strings(y)
-	return strings.Join(x, ",") == strings.Join(y, ",")
+
+// referencedBlocks son los bloques que alguien puede necesitar: los de los
+// archivos publicados y los de versiones que un handle abierto todavía lee.
+func referencedBlocks(v *State) map[string]StoredBlock {
+	refs := map[string]StoredBlock{}
+	eachBlock(v, func(b *StoredBlock) { refs[b.BlockID] = *b })
+	return refs
 }
 
-// Retained copies consume disk space but must not trigger another relocation:
-// balance decisions use active placement usage; admission still uses real disk.
-func (s *Server) balanceUsed(n *NodeInfo) int64 {
-	used := n.Used
-	for _, retired := range s.retired {
-		if retired.Node == n.NodeID {
-			if size, exists := n.Blocks[retired.Block]; exists {
-				used -= size + 32
-			}
-		}
-	}
-	return max(used, 0)
-}
 func eachBlock(v *State, fn func(*StoredBlock)) {
 	for _, f := range v.Files {
 		for i := range f.Blocks {
@@ -103,76 +148,26 @@ func eachBlock(v *State, fn func(*StoredBlock)) {
 		}
 	}
 }
-func (s *Server) maintenanceLoop() {
-	tick := time.NewTicker(s.cfg.MaintenanceInterval)
-	defer tick.Stop()
-	for range tick.C {
-		s.op.Lock()
-		if s.raft.State() == raft.Leader && s.raft.VerifyLeader().Error() == nil && s.raft.Barrier(3*time.Second).Error() == nil {
-			s.maintain()
-		}
-		s.op.Unlock()
-	}
-}
-func (s *Server) maintain() {
-	v := s.state()
-	changed := false
+
+// repairReplicas compara, bloque por bloque, cuántas copias válidas hay con
+// cuántas se desean. Repone una copia faltante o retira las sobrantes, y deja
+// en los metadatos dónde está realmente cada bloque.
+func (s *Server) repairReplicas(v *State, nodes []*NodeInfo, desired int, uploading bool) (changed, moved bool) {
 	now := time.Now()
-	activeUpload := false
-	for id, up := range v.Uploads {
-		if now.After(up.ExpiresAt) {
-			delete(v.Uploads, id)
-			changed = true
-		} else {
-			activeUpload = true
-		}
-	}
-	for id, h := range v.Handles {
-		if now.After(h.ExpiresAt) {
-			delete(v.Handles, id)
-			changed = true
-		}
-	}
-	nodes := s.aliveNodes()
-	verified := []*NodeInfo{}
-	for _, n := range nodes {
-		if s.inventory(s.nodes[n.NodeID]) {
-			verified = append(verified, s.nodes[n.NodeID])
-		}
-	}
-	refs := map[string]StoredBlock{}
-	eachBlock(v, func(b *StoredBlock) { refs[b.BlockID] = *b })
-	desired, _ := copiesPerBlock(s.cfg.ReplicationFactor, len(s.nodes), len(verified))
-	desired = min(desired, len(verified))
-	moved := false
-	for id, b := range refs {
-		holders := []*NodeInfo{}
-		allHolders := []*NodeInfo{}
-		for _, n := range verified {
-			if z, ok := n.Blocks[id]; ok && z == b.Size {
-				allHolders = append(allHolders, n)
-				if _, retired := s.retired[n.NodeID+":"+id]; !retired {
-					holders = append(holders, n)
-				}
+	for id, b := range referencedBlocks(v) {
+		holders, retired := s.holdersOf(id, b.Size, nodes)
+		// Una copia retirada que todavía existe vuelve a contar si hace falta.
+		for _, n := range retired {
+			if len(holders) >= desired {
+				break
 			}
+			delete(s.retired, n.NodeID+":"+id)
+			holders = append(holders, n)
 		}
-		if len(holders) < desired {
-			for _, n := range allHolders {
-				if _, retired := s.retired[n.NodeID+":"+id]; retired {
-					delete(s.retired, n.NodeID+":"+id)
-					holders = append(holders, n)
-					if len(holders) >= desired {
-						break
-					}
-				}
-			}
-		}
-		if len(holders) > desired && desired > 0 && !activeUpload {
-			sort.Slice(holders, func(i, j int) bool {
-				return float64(holders[i].Used)/float64(holders[i].Capacity) < float64(holders[j].Used)/float64(holders[j].Capacity)
-			})
+		if len(holders) > desired && desired > 0 && !uploading {
+			sortByOccupancy(holders, func(n *NodeInfo) int64 { return n.Used })
 			for _, n := range holders[desired:] {
-				s.retired[n.NodeID+":"+id] = retiredReplica{Node: n.NodeID, Block: id, At: now.Add(s.cfg.GCGrace)}
+				s.retire(n.NodeID, id, now)
 			}
 			holders = holders[:desired]
 			moved = true
@@ -181,146 +176,258 @@ func (s *Server) maintain() {
 			continue
 		}
 		if len(holders) < desired && !moved {
-			sort.Slice(verified, func(i, j int) bool {
-				return float64(verified[i].Used)/float64(verified[i].Capacity) < float64(verified[j].Used)/float64(verified[j].Capacity)
-			})
-			for _, n := range verified {
-				if _, has := n.Blocks[id]; !has && float64(n.Used+b.Size+32) <= float64(n.Capacity)*s.cfg.FullThreshold {
-					if s.copyBlock(holders[0], n, b) {
-						holders = append(holders, n)
-						moved = true
-						log.Printf("repair block=%s destination=%s", id, n.NodeID)
-					}
-					break
-				}
+			if dst := s.repairTarget(id, b.Size, nodes); dst != nil && s.copyBlock(holders[0], dst, b) {
+				holders = append(holders, dst)
+				moved = true
+				log.Printf("reparación bloque=%s destino=%s", id, dst.NodeID)
 			}
 		}
-		ids := []string{}
+		ids := make([]string, 0, len(holders))
 		for _, n := range holders {
 			ids = append(ids, n.NodeID)
 		}
-		if len(ids) > 0 {
-			eachBlock(v, func(x *StoredBlock) {
-				if x.BlockID == id && !sameIDs(x.StoredOn, ids) {
-					x.StoredOn = append([]string{}, ids...)
-					changed = true
-				}
-			})
-		}
-	}
-	// At most one relocation per pass bounds background traffic. Publish the new
-	// map through Raft before deleting the source, never the other way around.
-
-	refs = map[string]StoredBlock{}
-	eachBlock(v, func(b *StoredBlock) { refs[b.BlockID] = *b })
-	if !moved && !activeUpload && len(verified) > 1 {
-		sort.Slice(verified, func(i, j int) bool {
-			return float64(s.balanceUsed(verified[i]))/float64(verified[i].Capacity) < float64(s.balanceUsed(verified[j]))/float64(verified[j].Capacity)
+		eachBlock(v, func(x *StoredBlock) {
+			if x.BlockID == id && !sameIDs(x.StoredOn, ids) {
+				x.StoredOn = append([]string{}, ids...)
+				changed = true
+			}
 		})
-		lo, hi := verified[0], verified[len(verified)-1]
-		gap := float64(s.balanceUsed(hi))/float64(hi.Capacity) - float64(s.balanceUsed(lo))/float64(lo.Capacity)
-		if gap > s.cfg.RebalanceThreshold {
-			for id, b := range refs {
-				_, from := hi.Blocks[id]
-				// A physically retained old copy is not an active placement.
-				activeSource := false
-				for _, nodeID := range b.StoredOn {
-					if nodeID == hi.NodeID {
-						activeSource = true
-					}
-				}
-				_, to := lo.Blocks[id]
-				nextGap := float64(s.balanceUsed(hi)-b.Size)/float64(hi.Capacity) - float64(s.balanceUsed(lo)+b.Size)/float64(lo.Capacity)
-				if from && activeSource && !to && len(b.StoredOn) >= desired && float64(lo.Used+b.Size+32) <= float64(lo.Capacity)*s.cfg.FullThreshold && nextGap >= 0 && nextGap < gap && s.copyBlock(hi, lo, b) {
-					eachBlock(v, func(x *StoredBlock) {
-						if x.BlockID == id {
-							ids := []string{}
-							for _, n := range x.StoredOn {
-								if n != hi.NodeID {
-									ids = append(ids, n)
-								}
-							}
-							ids = append(ids, lo.NodeID)
-							x.StoredOn = ids
-						}
-					})
-					changed = true
-					s.retired[hi.NodeID+":"+id] = retiredReplica{Node: hi.NodeID, Block: id, At: now.Add(s.cfg.GCGrace)}
-					log.Printf("rebalance block=%s source=%s target=%s", id, hi.NodeID, lo.NodeID)
-					break
-				}
+	}
+	return changed, moved
+}
+
+// holdersOf devuelve los nodos que tienen el bloque con el tamaño correcto,
+// separando las copias activas de las que están retiradas esperando borrado.
+func (s *Server) holdersOf(id string, size int64, nodes []*NodeInfo) (active, retired []*NodeInfo) {
+	for _, n := range nodes {
+		if z, ok := n.Blocks[id]; ok && z == size {
+			if _, r := s.retired[n.NodeID+":"+id]; r {
+				retired = append(retired, n)
+			} else {
+				active = append(active, n)
 			}
 		}
 	}
-	if changed {
-		if e := s.save(v); e != nil {
-			log.Printf("maintenance metadata: %v", e)
+	return active, retired
+}
+
+// repairTarget elige el nodo menos ocupado que no tiene el bloque y que lo
+// puede recibir sin pasar el umbral de ocupación.
+func (s *Server) repairTarget(id string, size int64, nodes []*NodeInfo) *NodeInfo {
+	candidates := append([]*NodeInfo(nil), nodes...)
+	sortByOccupancy(candidates, func(n *NodeInfo) int64 { return n.Used })
+	for _, n := range candidates {
+		if _, has := n.Blocks[id]; !has && s.fits(n, size) {
+			return n
+		}
+	}
+	return nil
+}
+
+// rebalanceOne mueve un bloque del nodo más ocupado al menos ocupado si la
+// diferencia supera el umbral. Primero copia y verifica; la copia vieja queda
+// retirada y se borra después, nunca antes de publicar el mapa nuevo.
+func (s *Server) rebalanceOne(v *State, nodes []*NodeInfo, desired int) bool {
+	if len(nodes) < 2 {
+		return false
+	}
+	sorted := append([]*NodeInfo(nil), nodes...)
+	sortByOccupancy(sorted, s.balanceUsed)
+	lo, hi := sorted[0], sorted[len(sorted)-1]
+	gap := s.occupancy(hi, s.balanceUsed(hi)) - s.occupancy(lo, s.balanceUsed(lo))
+	if gap <= s.cfg.RebalanceThreshold {
+		return false
+	}
+	for id, b := range referencedBlocks(v) {
+		_, onHi := hi.Blocks[id]
+		_, onLo := lo.Blocks[id]
+		nextGap := s.occupancy(hi, s.balanceUsed(hi)-b.Size) - s.occupancy(lo, s.balanceUsed(lo)+b.Size)
+		if !onHi || onLo || !contains(b.StoredOn, hi.NodeID) || len(b.StoredOn) < desired ||
+			!s.fits(lo, b.Size) || nextGap < 0 || nextGap >= gap {
+			continue
+		}
+		if !s.copyBlock(hi, lo, b) {
+			continue
+		}
+		eachBlock(v, func(x *StoredBlock) {
+			if x.BlockID == id {
+				ids := []string{}
+				for _, n := range x.StoredOn {
+					if n != hi.NodeID {
+						ids = append(ids, n)
+					}
+				}
+				x.StoredOn = append(ids, lo.NodeID)
+			}
+		})
+		s.retire(hi.NodeID, id, time.Now())
+		log.Printf("rebalanceo bloque=%s origen=%s destino=%s", id, hi.NodeID, lo.NodeID)
+		return true
+	}
+	return false
+}
+
+// deleteRetired borra las copias retiradas cuyo plazo de gracia ya pasó, solo
+// si el bloque sigue teniendo suficientes copias válidas en otros nodos.
+func (s *Server) deleteRetired(refs map[string]StoredBlock, nodes []*NodeInfo, desired int) {
+	now := time.Now()
+	for k, d := range s.retired {
+		if now.Before(d.At) {
+			continue
+		}
+		n := s.nodes[d.Node]
+		if n == nil || !s.isAlive(n) {
+			continue
+		}
+		if b, used := refs[d.Block]; used {
+			others := 0
+			for _, other := range nodes {
+				if size, ok := other.Blocks[d.Block]; ok && size == b.Size && other.NodeID != n.NodeID {
+					others++
+				}
+			}
+			if others < max(desired, 1) {
+				continue
+			}
+		}
+		if s.raft.VerifyLeader().Error() != nil {
 			return
 		}
+		if s.deleteBlock(n, d.Block) {
+			delete(s.retired, k)
+		}
 	}
-	// Retain old locations until all previously issued capabilities expire.
-	if !activeUpload {
-		for k, d := range s.retired {
-			if now.Before(d.At) {
+}
+
+// collectOrphans borra bloques que ningún archivo referencia: los de archivos
+// eliminados o subidas abortadas. Espera GC_GRACE_SECONDS desde que el líder
+// los ve huérfanos (la cuenta vive en su memoria, así que un líder nuevo
+// empieza de cero) y desde que arrancó el proceso, para no borrar algo que un
+// cliente todavía puede estar usando con un permiso ya emitido.
+func (s *Server) collectOrphans(refs map[string]StoredBlock, nodes []*NodeInfo) {
+	now := time.Now()
+	for _, n := range nodes {
+		for id := range n.Blocks {
+			key := n.NodeID + ":" + id
+			if _, used := refs[id]; used {
+				delete(s.orphanSince, key)
 				continue
 			}
-			n := s.nodes[d.Node]
-			if n == nil || !s.isAlive(n) {
+			first, seen := s.orphanSince[key]
+			if !seen {
+				s.orphanSince[key] = now
 				continue
 			}
-			b, used := refs[d.Block]
-			if used {
-				count := 0
-				for _, other := range verified {
-					if other.NodeID != n.NodeID {
-						if size, ok := other.Blocks[d.Block]; ok && size == b.Size {
-							count++
-						}
-					}
-				}
-				if count < max(desired, 1) {
-					continue
-				}
+			if now.Sub(first) < s.cfg.GCGrace || time.Since(s.started) < s.cfg.GCGrace {
+				continue
 			}
 			if s.raft.VerifyLeader().Error() != nil {
 				return
 			}
-			resp, e := s.internal("DELETE", n.URL+"/blocks/"+d.Block, nil)
-			if e == nil {
-				resp.Body.Close()
-				if resp.StatusCode < 300 {
-					delete(n.Blocks, d.Block)
-					delete(s.retired, k)
-				}
+			if s.deleteBlock(n, id) {
+				delete(s.orphanSince, key)
 			}
 		}
 	}
+}
 
-	// Delay deletion beyond every issued read/write capability. During a live
-	// upload its hashes are unknown, so GC conservatively pauses cluster-wide.
-	if activeUpload {
-		return
+// copyBlock le ordena al DataNode src que copie el bloque a dst, y confirma
+// con dst que la copia quedó íntegra antes de contarla.
+func (s *Server) copyBlock(src, dst *NodeInfo, b StoredBlock) bool {
+	resp, e := s.internal(s.client, "POST", src.URL+"/blocks/"+b.BlockID+"/replicate", map[string]any{"target": Target{Node: dst.NodeID, URL: dst.URL}}, nil)
+	if e != nil {
+		return false
 	}
-	for _, n := range verified {
-		for id := range n.Blocks {
-			orphanKey := n.NodeID + ":" + id
-			if _, used := refs[id]; used {
-				delete(s.orphanSince, orphanKey)
-				continue
-			}
-			first, seen := s.orphanSince[orphanKey]
-			if !seen {
-				s.orphanSince[orphanKey] = now
-				continue
-			}
-			if now.Sub(first) >= s.cfg.GCGrace && time.Since(s.started) >= s.cfg.GCGrace && s.raft.VerifyLeader().Error() == nil {
-				resp, e := s.internal("DELETE", n.URL+"/blocks/"+id, nil)
-				if e == nil {
-					resp.Body.Close()
-					delete(n.Blocks, id)
-					delete(s.orphanSince, orphanKey)
-				}
+	resp.Body.Close()
+	if resp.StatusCode >= 300 || !s.verifyBlock(dst, b) {
+		return false
+	}
+	if dst.Blocks == nil {
+		dst.Blocks = map[string]int64{}
+	}
+	dst.Blocks[b.BlockID] = b.Size
+	dst.Used += b.Size
+	return true
+}
+
+func (s *Server) deleteBlock(n *NodeInfo, id string) bool {
+	resp, e := s.internal(s.quickClient, "DELETE", n.URL+"/blocks/"+id, nil, nil)
+	if e != nil {
+		return false
+	}
+	resp.Body.Close()
+	if resp.StatusCode >= 300 {
+		return false
+	}
+	delete(n.Blocks, id)
+	return true
+}
+
+// internal hace una petición entre nodos autenticada con la clave del clúster.
+func (s *Server) internal(client *http.Client, method, url string, body any, headers map[string]string) (*http.Response, error) {
+	var b bytes.Buffer
+	if body != nil {
+		_ = json.NewEncoder(&b).Encode(body)
+	}
+	req, e := http.NewRequest(method, url, &b)
+	if e != nil {
+		return nil, e
+	}
+	req.Header.Set("X-Cluster-Key", s.cfg.Security.ClusterKey)
+	req.Header.Set("Content-Type", "application/json")
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	return client.Do(req)
+}
+
+func (s *Server) retire(node, block string, now time.Time) {
+	s.retired[node+":"+block] = retiredReplica{Node: node, Block: block, At: now.Add(s.cfg.GCGrace)}
+}
+
+// balanceUsed es la ocupación que cuenta para rebalancear: descuenta las
+// copias retiradas, que todavía ocupan disco pero ya no son ubicaciones
+// activas. Sin esto, el nodo de origen seguiría pareciendo lleno y el
+// rebalanceo movería bloques de ida y vuelta.
+func (s *Server) balanceUsed(n *NodeInfo) int64 {
+	used := n.Used
+	for _, retired := range s.retired {
+		if retired.Node == n.NodeID {
+			if size, exists := n.Blocks[retired.Block]; exists {
+				used -= size
 			}
 		}
 	}
+	return max(used, 0)
+}
+
+func (s *Server) occupancy(n *NodeInfo, used int64) float64 {
+	return float64(used) / float64(max(n.Capacity, 1))
+}
+
+func (s *Server) fits(n *NodeInfo, size int64) bool {
+	return float64(n.Used+size) <= float64(n.Capacity)*s.cfg.FullThreshold
+}
+
+func sortByOccupancy(nodes []*NodeInfo, used func(*NodeInfo) int64) {
+	sort.Slice(nodes, func(i, j int) bool {
+		return float64(used(nodes[i]))/float64(max(nodes[i].Capacity, 1)) < float64(used(nodes[j]))/float64(max(nodes[j].Capacity, 1))
+	})
+}
+
+func contains(list []string, item string) bool {
+	for _, x := range list {
+		if x == item {
+			return true
+		}
+	}
+	return false
+}
+
+func sameIDs(a, b []string) bool {
+	x := append([]string{}, a...)
+	y := append([]string{}, b...)
+	sort.Strings(x)
+	sort.Strings(y)
+	return strings.Join(x, ",") == strings.Join(y, ",")
 }

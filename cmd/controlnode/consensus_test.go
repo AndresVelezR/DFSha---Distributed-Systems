@@ -2,8 +2,9 @@ package main
 
 import (
 	"encoding/json"
-	"github.com/hashicorp/raft"
 	"testing"
+
+	"github.com/hashicorp/raft"
 )
 
 func TestStaleFullStateCannotEraseConfirmedOperation(t *testing.T) {

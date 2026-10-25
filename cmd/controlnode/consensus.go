@@ -2,11 +2,8 @@ package main
 
 import (
 	"crypto/tls"
-	"dfsha/internal/common"
 	"encoding/json"
 	"fmt"
-	"github.com/hashicorp/raft"
-	bolt "github.com/hashicorp/raft-boltdb/v2"
 	"io"
 	"net"
 	"os"
@@ -14,15 +11,25 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"dfsha/internal/common"
+
+	"github.com/hashicorp/raft"
+	bolt "github.com/hashicorp/raft-boltdb/v2"
 )
 
-// Raft is the sole authority for published metadata and leases. No HTTP
-// handler changes the FSM before its log entry is committed by a majority.
+// metadataFSM es la máquina de estados que replica Raft. Ningún handler
+// cambia el estado directamente: propone un estado nuevo con save y solo se
+// aplica aquí cuando una mayoría de ControlNodes lo guardó en su registro.
 type metadataFSM struct {
 	mu    sync.RWMutex
 	state *State
 }
 
+// Apply recibe cada entrada confirmada del registro, en el mismo orden en los
+// tres ControlNodes. Cada entrada es el estado completo con un número de
+// revisión: solo se acepta la revisión siguiente a la actual, así que un
+// estado viejo nunca puede pisar uno más nuevo.
 func (f *metadataFSM) Apply(l *raft.Log) any {
 	var s State
 	if e := json.Unmarshal(l.Data, &s); e != nil {
@@ -40,6 +47,8 @@ func (f *metadataFSM) Apply(l *raft.Log) any {
 	return nil
 }
 
+// Snapshot y Restore permiten a Raft compactar su registro: guarda una foto
+// del estado y descarta las entradas anteriores.
 type snapshot struct{ data []byte }
 
 func (f *metadataFSM) Snapshot() (raft.FSMSnapshot, error) {
@@ -68,6 +77,8 @@ func (f *metadataFSM) Restore(r io.ReadCloser) error {
 	return nil
 }
 
+// Raft viaja por TCP en RAFT_ADDR, con TLS mutuo: cada ControlNode presenta
+// el certificado del clúster y exige el del otro.
 type advertisedAddress string
 
 func (a advertisedAddress) Network() string { return "tcp" }
@@ -86,6 +97,10 @@ func (s *streamLayer) Dial(addr raft.ServerAddress, timeout time.Duration) (net.
 	return tls.DialWithDialer(&net.Dialer{Timeout: timeout}, "tcp", string(addr), s.config.Clone())
 }
 func (s *streamLayer) Addr() net.Addr { return s.advertise }
+
+// startRaft abre el registro persistente (BoltDB) y los snapshots en
+// METADATA_DIR y se une a los otros dos ControlNodes de CN_PEERS. La primera
+// vez que arranca un clúster vacío, lo inicializa con esos tres votantes.
 func (s *Server) startRaft() error {
 	if e := os.MkdirAll(s.cfg.DataDir, 0700); e != nil {
 		return e
@@ -154,8 +169,8 @@ func (s *Server) startRaft() error {
 	if !own {
 		return fmt.Errorf("NODE_ID ausente en CN_PEERS")
 	}
-	if len(configuration.Servers) != 3 && getenv("ALLOW_SINGLE_CONTROL", "false") != "true" {
-		return fmt.Errorf("se requieren3 ControlNodes; ALLOW_SINGLE_CONTROL solo desarrollo")
+	if len(configuration.Servers) != 3 {
+		return fmt.Errorf("se requieren 3 ControlNodes en CN_PEERS")
 	}
 	if !existing {
 		if e = s.raft.BootstrapCluster(configuration).Error(); e != nil {

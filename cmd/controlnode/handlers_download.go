@@ -1,21 +1,16 @@
 package main
 
 import (
-	"dfsha/internal/common"
-	"encoding/json"
 	"net/http"
 	"time"
+
+	"dfsha/internal/common"
 )
 
-func jsonMarshal(v any) (map[string]any, error) {
-	b, e := json.Marshal(v)
-	if e != nil {
-		return nil, e
-	}
-	var m map[string]any
-	e = json.Unmarshal(b, &m)
-	return m, e
-}
+// downloadPlan devuelve, para cada bloque, las réplicas que están en DataNodes
+// vivos con un permiso de lectura de un minuto para cada una. El cliente
+// descarga directamente de los DataNodes y pasa a la siguiente réplica si una
+// falla.
 func (s *Server) downloadPlan(w http.ResponseWriter, r *http.Request) {
 	p, ok := remote(w, r.URL.Query().Get("path"))
 	if !ok {

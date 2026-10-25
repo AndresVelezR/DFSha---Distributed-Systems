@@ -2,7 +2,6 @@ package main
 
 import (
 	"crypto/rand"
-	"dfsha/internal/common"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -10,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"time"
+
+	"dfsha/internal/common"
 )
 
 func newUploadID() string {
@@ -19,6 +20,11 @@ func newUploadID() string {
 	}
 	return hex.EncodeToString(b)
 }
+
+// decorate agrega a cada destino del plan un permiso de escritura firmado,
+// válido solo en ese DataNode, hasta que venza la reserva y para bloques de
+// hasta block_size. Con él el cliente escribe en el DataNode sin que este
+// tenga que consultar al ControlNode.
 func (s *Server) decorate(up *UploadSession) {
 	for i := range up.Blocks {
 		for j := range up.Blocks[i].Targets {
@@ -27,6 +33,11 @@ func (s *Server) decorate(up *UploadSession) {
 		}
 	}
 }
+
+// uploadPlan es el inicio de una subida (open + lock del Hito 1): valida la
+// ruta, reserva el archivo para un solo escritor, calcula el tamaño de bloque
+// y decide en qué DataNodes va cada copia. El archivo todavía no existe para
+// nadie: solo aparece con el commit.
 func (s *Server) uploadPlan(w http.ResponseWriter, r *http.Request) {
 	var q struct {
 		Path   string
@@ -73,59 +84,33 @@ func (s *Server) uploadPlan(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	bs := chooseBlockSize(q.Size, len(nodes), s.cfg.BlockSizing)
-	count := numberOfBlocks(q.Size, bs)
-	if count > 100000 {
-		fail(w, 413, "demasiados bloques para plano de control académico")
+	sizes := blockSizes(q.Size, bs)
+	if len(sizes) > maxBlocksPerFile {
+		fail(w, 413, "el archivo produce demasiados bloques")
 		return
 	}
-	target, copies := copiesPerBlock(s.cfg.ReplicationFactor, len(s.nodes), len(nodes))
-	_ = target
-	// Reserve capacity of other in-flight plans as well as bytes already on disk.
-	for _, up := range v.Uploads {
-		if time.Now().Before(up.ExpiresAt) {
-			for _, b := range up.Blocks {
+	_, copies := copiesPerBlock(s.cfg.ReplicationFactor, len(s.nodes), len(nodes))
+	// Las subidas en curso todavía no aparecen en el disco de los DataNodes:
+	// se suman a su ocupación para no prometer dos veces el mismo espacio.
+	for _, other := range v.Uploads {
+		if time.Now().Before(other.ExpiresAt) {
+			for _, b := range other.Blocks {
 				for _, t := range b.Targets {
 					for _, n := range nodes {
 						if n.NodeID == t.Node {
-							n.Used += up.BlockSize
+							n.Used += other.BlockSize
 						}
 					}
 				}
 			}
 		}
 	}
-	plans := make([]BlockPlan, count)
-	virtual := map[string]int64{}
-	for _, n := range nodes {
-		virtual[n.NodeID] = n.Used
+	plans, ok := placeBlocks(nodes, sizes, copies, s.cfg.FullThreshold)
+	if !ok {
+		fail(w, 507, "no hay espacio suficiente en los DataNodes")
+		return
 	}
-	for i := range plans {
-		size := min(bs, max(q.Size-int64(i)*bs, 0))
-		sort.Slice(nodes, func(a, b int) bool {
-			ra := float64(virtual[nodes[a].NodeID]) / float64(nodes[a].Capacity)
-			rb := float64(virtual[nodes[b].NodeID]) / float64(nodes[b].Capacity)
-			if ra == rb {
-				return nodes[a].NodeID < nodes[b].NodeID
-			}
-			return ra < rb
-		})
-		plans[i] = BlockPlan{Index: i, Targets: []Target{}}
-		for _, n := range nodes {
-			if float64(virtual[n.NodeID]+size+32) > float64(n.Capacity)*s.cfg.FullThreshold {
-				continue
-			}
-			plans[i].Targets = append(plans[i].Targets, Target{Node: n.NodeID, URL: n.URL})
-			virtual[n.NodeID] += size + 32
-			if len(plans[i].Targets) == copies {
-				break
-			}
-		}
-		if len(plans[i].Targets) < copies {
-			fail(w, 507, "capacidad insuficiente por nodo o umbral de ocupación")
-			return
-		}
-	}
-	up := &UploadSession{UploadID: newUploadID(), Owner: u, Path: p, Size: q.Size, SHA256: q.SHA256, BlockSize: bs, NBlocks: count, ExpiresAt: time.Now().Add(s.cfg.WriteLeaseTTL), Blocks: plans, Handle: q.Handle}
+	up := &UploadSession{UploadID: newUploadID(), Owner: u, Path: p, Size: q.Size, SHA256: q.SHA256, BlockSize: bs, NBlocks: len(sizes), ExpiresAt: time.Now().Add(s.cfg.WriteLeaseTTL), Blocks: plans, Handle: q.Handle}
 	v.Uploads[up.UploadID] = up
 	if !s.persist(w, v) {
 		return
@@ -133,6 +118,9 @@ func (s *Server) uploadPlan(w http.ResponseWriter, r *http.Request) {
 	s.decorate(up)
 	writeJSON(w, 200, up)
 }
+
+// uploadRenew extiende la reserva mientras el cliente sigue subiendo. Si el
+// cliente muere deja de renovarla y la reserva vence sola.
 func (s *Server) uploadRenew(w http.ResponseWriter, r *http.Request) {
 	var q struct {
 		UploadID string `json:"upload_id"`
@@ -156,19 +144,27 @@ func (s *Server) uploadRenew(w http.ResponseWriter, r *http.Request) {
 	s.decorate(up)
 	writeJSON(w, 200, up)
 }
+
+// verifyBlock le pregunta al DataNode, con un HEAD, si tiene el bloque íntegro
+// y del tamaño esperado. Si se indica blockOwner, además exige que esa cuenta
+// haya subido el bloque a ese nodo.
 func (s *Server) verifyBlock(n *NodeInfo, b StoredBlock, blockOwner ...string) bool {
-	req, _ := http.NewRequest("HEAD", n.URL+"/blocks/"+b.BlockID, nil)
-	req.Header.Set("X-Cluster-Key", s.cfg.Security.ClusterKey)
+	headers := map[string]string{}
 	if len(blockOwner) > 0 {
-		req.Header.Set("X-Block-Owner", blockOwner[0])
+		headers["X-Block-Owner"] = blockOwner[0]
 	}
-	resp, e := s.client.Do(req)
+	resp, e := s.internal(s.quickClient, "HEAD", n.URL+"/blocks/"+b.BlockID, nil, headers)
 	if e != nil {
 		return false
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode == 200 && resp.Header.Get("X-Block-SHA256") == b.BlockID && resp.Header.Get("Content-Length") == strconv.FormatInt(b.Size, 10)
 }
+
+// uploadCommit publica el archivo. Antes de confiar en lo que dice el
+// cliente, pregunta a cada DataNode del plan si tiene la copia íntegra y si
+// fue esta cuenta quien la subió. Solo si todas están, publica el manifiesto
+// por Raft. Repetir el commit con el mismo upload_id es seguro.
 func (s *Server) uploadCommit(w http.ResponseWriter, r *http.Request) {
 	var q struct {
 		UploadID string        `json:"upload_id"`
@@ -202,11 +198,11 @@ func (s *Server) uploadCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	sort.Slice(q.Blocks, func(i, j int) bool { return q.Blocks[i].Index < q.Blocks[j].Index })
+	expected := blockSizes(up.Size, up.BlockSize)
 	for i := range q.Blocks {
 		b := &q.Blocks[i]
-		expected := min(up.BlockSize, max(up.Size-int64(i)*up.BlockSize, 0))
-		if b.Index != i || b.Size != expected || !common.ValidID(b.BlockID) {
-			fail(w, 409, fmt.Sprintf("bloque%d inválido", i))
+		if b.Index != i || b.Size != expected[i] || !common.ValidID(b.BlockID) {
+			fail(w, 409, fmt.Sprintf("bloque %d inválido", i))
 			return
 		}
 		verified := []string{}
@@ -238,6 +234,9 @@ func (s *Server) uploadCommit(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"status": "publicado", "path": up.Path, "replicas_ok": s.liveReplicas(f.Blocks)})
 	}
 }
+
+// uploadAbort libera la reserva. Los bloques ya subidos quedan huérfanos y
+// los borra el mantenimiento.
 func (s *Server) uploadAbort(w http.ResponseWriter, r *http.Request) {
 	var q struct {
 		UploadID string `json:"upload_id"`
