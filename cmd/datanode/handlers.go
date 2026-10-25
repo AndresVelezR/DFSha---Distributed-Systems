@@ -153,14 +153,13 @@ func (n *Node) getBlock(w http.ResponseWriter, r *http.Request, id string) {
 			return
 		}
 	}
-	n.storageMu.Lock()
-	plain, err := n.readBlockLocked(id)
-	n.storageMu.Unlock()
+	plain, err := n.readBlock(id)
 	if err != nil {
 		if os.IsNotExist(err) {
 			fail(w, http.StatusNotFound, "bloque no existe")
 		} else {
 			log.Printf("integridad %s: %v", id, err)
+			n.forgetVerified(id)
 			fail(w, http.StatusInternalServerError, "bloque corrupto o ilegible")
 		}
 		return
@@ -202,13 +201,12 @@ func (n *Node) replicate(w http.ResponseWriter, r *http.Request, id string) {
 		fail(w, http.StatusBadRequest, "destino de réplica no válido")
 		return
 	}
-	n.storageMu.Lock()
-	plain, err := n.readBlockLocked(id)
-	n.storageMu.Unlock()
+	plain, err := n.readBlock(id)
 	if err != nil {
 		if os.IsNotExist(err) {
 			fail(w, http.StatusNotFound, "bloque no existe")
 		} else {
+			n.forgetVerified(id)
 			fail(w, http.StatusInternalServerError, "bloque corrupto o ilegible")
 		}
 		return

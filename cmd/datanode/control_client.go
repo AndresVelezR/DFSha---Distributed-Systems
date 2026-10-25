@@ -64,8 +64,8 @@ func (n *Node) postControl(endpoint string, body any) error {
 	if err != nil {
 		return err
 	}
-	// An unreachable ControlNode must not delay the next healthy node's
-	// heartbeat. All peers receive this report concurrently with one deadline.
+	// Se envía a los tres ControlNodes en paralelo, con un plazo cada uno,
+	// para que uno caído no retrase el heartbeat que le llega al líder.
 	results := make(chan error, len(n.ControlURLs))
 	for _, base := range n.ControlURLs {
 		go func(base string) { results <- n.postOneControl(base, endpoint, b) }(base)

@@ -336,3 +336,33 @@ func TestReportsReachEveryControlAndTolerateFollower(t *testing.T) {
 		}
 	}
 }
+
+// El inventario reutiliza la verificación de un bloque mientras su archivo no
+// cambie, pero vuelve a verificar y excluye una copia alterada en disco.
+func TestInventoryReverifiesChangedBlock(t *testing.T) {
+	n := testNode(t, "dn-01")
+	content := []byte("bloque que luego se altera en disco")
+	id := hashID(content)
+	if _, err := n.store(id, content); err != nil {
+		t.Fatal(err)
+	}
+	if blocks, used := n.localInventory(); len(blocks) != 1 || used != int64(len(content)) {
+		t.Fatalf("inventario inicial: %v %d", blocks, used)
+	}
+	path := filepath.Join(n.StorageDir, id)
+	sealed, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealed[len(sealed)-1] ^= 1
+	if err := os.WriteFile(path, sealed, 0600); err != nil {
+		t.Fatal(err)
+	}
+	later := time.Now().Add(time.Second)
+	if err := os.Chtimes(path, later, later); err != nil {
+		t.Fatal(err)
+	}
+	if blocks, used := n.localInventory(); len(blocks) != 0 || used != 0 {
+		t.Fatalf("el bloque alterado siguió en el inventario: %v %d", blocks, used)
+	}
+}

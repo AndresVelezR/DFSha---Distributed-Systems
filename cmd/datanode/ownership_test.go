@@ -1,10 +1,11 @@
 package main
 
 import (
-	"dfsha/internal/common"
 	"net/http"
 	"testing"
 	"time"
+
+	"dfsha/internal/common"
 )
 
 func TestKnownHashDoesNotGrantAnotherAccountOwnership(t *testing.T) {

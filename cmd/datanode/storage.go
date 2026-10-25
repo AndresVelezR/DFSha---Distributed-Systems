@@ -12,6 +12,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"time"
 )
 
 var blockMagic = []byte("DFSHA1\x00")
@@ -34,13 +35,15 @@ func hashID(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// El mutex protege publicación, lectura e inventario; nunca se conserva
-// durante transferencias de red. Cada escritura obtiene un temporal único.
+// store guarda un bloque cifrado. El mutex protege la decisión de escribir y
+// el inventario; nunca se conserva durante transferencias de red. El bloque se
+// escribe a un temporal y se renombra al final, así que un bloque nunca queda
+// visible a medias y las lecturas no necesitan el mutex.
 func (n *Node) store(id string, plain []byte) (bool, error) {
 	n.storageMu.Lock()
 	defer n.storageMu.Unlock()
 	p := filepath.Join(n.StorageDir, id)
-	if existing, err := n.readBlockLocked(id); err == nil {
+	if existing, err := n.readBlock(id); err == nil {
 		if !bytes.Equal(existing, plain) {
 			return false, errors.New("conflicto con bloque inmutable")
 		}
@@ -120,7 +123,9 @@ func (n *Node) encrypt(id string, plain []byte) ([]byte, error) {
 	return gcm.Seal(sealed, nonce, plain, []byte(id)), nil
 }
 
-func (n *Node) readBlockLocked(id string) ([]byte, error) {
+// readBlock lee, descifra y verifica un bloque. Un bloque publicado no cambia
+// nunca, así que se puede leer sin el mutex.
+func (n *Node) readBlock(id string) ([]byte, error) {
 	f, err := os.Open(filepath.Join(n.StorageDir, id))
 	if err != nil {
 		return nil, err
@@ -156,6 +161,19 @@ func (n *Node) localInventory() ([]blockInfo, int64) {
 	return n.inventoryLocked()
 }
 
+// verifiedFile recuerda que un archivo de bloque ya se descifró y verificó,
+// y cómo era en disco en ese momento.
+type verifiedFile struct {
+	diskSize int64
+	modTime  time.Time
+	size     int64 // bytes del bloque sin cifrar
+}
+
+// inventoryLocked lista los bloques válidos y los bytes que ocupan. Cada
+// bloque se verifica completo una sola vez; mientras su archivo no cambie de
+// tamaño ni de fecha se reutiliza ese resultado. Así el heartbeat, que pide el
+// inventario cada pocos segundos, no vuelve a descifrar todo el disco, y una
+// copia alterada en disco se vuelve a verificar y se excluye.
 func (n *Node) inventoryLocked() ([]blockInfo, int64) {
 	blocks := []blockInfo{}
 	var used int64
@@ -164,18 +182,46 @@ func (n *Node) inventoryLocked() ([]blockInfo, int64) {
 		log.Printf("leer inventario %s: %v", n.ID, err)
 		return blocks, used
 	}
+	if n.verified == nil {
+		n.verified = map[string]verifiedFile{}
+	}
+	present := map[string]bool{}
 	for _, e := range entries {
-		if e.IsDir() || !validID(e.Name()) {
+		id := e.Name()
+		if e.IsDir() || !validID(id) {
 			continue
 		}
-		plain, err := n.readBlockLocked(e.Name())
+		info, err := e.Info()
 		if err != nil {
-			log.Printf("excluyendo bloque corrupto %s: %v", e.Name(), err)
 			continue
 		}
-		size := int64(len(plain))
-		blocks = append(blocks, blockInfo{BlockID: e.Name(), Size: size})
-		used += size
+		present[id] = true
+		cached, ok := n.verified[id]
+		if !ok || cached.diskSize != info.Size() || !cached.modTime.Equal(info.ModTime()) {
+			plain, err := n.readBlock(id)
+			if err != nil {
+				log.Printf("excluyendo bloque corrupto %s: %v", id, err)
+				delete(n.verified, id)
+				continue
+			}
+			cached = verifiedFile{diskSize: info.Size(), modTime: info.ModTime(), size: int64(len(plain))}
+			n.verified[id] = cached
+		}
+		blocks = append(blocks, blockInfo{BlockID: id, Size: cached.size})
+		used += cached.size
+	}
+	for id := range n.verified {
+		if !present[id] {
+			delete(n.verified, id)
+		}
 	}
 	return blocks, used
+}
+
+// forgetVerified obliga a verificar de nuevo un bloque, por ejemplo después
+// de que una lectura lo encontró corrupto.
+func (n *Node) forgetVerified(id string) {
+	n.storageMu.Lock()
+	delete(n.verified, id)
+	n.storageMu.Unlock()
 }

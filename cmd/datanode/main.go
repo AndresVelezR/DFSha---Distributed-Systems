@@ -24,7 +24,9 @@ type Node struct {
 	Capacity    int64
 	Config      common.Config
 	Client      *http.Client
-	storageMu   sync.Mutex
+
+	storageMu sync.Mutex              // protege escrituras, borrados e inventario
+	verified  map[string]verifiedFile // bloques ya verificados, ver inventoryLocked
 }
 
 type blockInfo struct {

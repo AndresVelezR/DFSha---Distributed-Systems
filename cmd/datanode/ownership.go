@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 )
 
-// A known SHA alone is not proof that an account owns a block. Record a
-// verified PUT by that account; the ControlNode checks this before publication.
-// Repair copies do not grant ownership to a different account.
+// Conocer el SHA-256 de un bloque no prueba que se tenga su contenido. Por eso
+// el DataNode anota qué cuenta subió cada bloque, y el ControlNode lo revisa
+// antes de publicar un archivo. Las copias de reparación no cambian autoría.
 func (n *Node) ownerPath(id, user string) string {
 	return filepath.Join(n.StorageDir, ".owners", id, hashID([]byte(user)))
 }
