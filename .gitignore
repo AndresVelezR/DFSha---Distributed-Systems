@@ -1,5 +1,5 @@
 # Secretos generados por scripts/setup.py: claves, certificados y contraseñas
-.secrets/
+.secrets*/
 credentials.txt
 *.key
 *.pem

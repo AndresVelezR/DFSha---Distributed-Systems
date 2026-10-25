@@ -1,6 +1,6 @@
 .git
 .github
-.secrets
+.secrets*
 .env
 bin
 data

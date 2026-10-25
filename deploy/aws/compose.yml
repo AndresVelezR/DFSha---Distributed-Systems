@@ -1,5 +1,8 @@
-# Ejecutar desde raíz: docker compose --env-file deploy/aws/node1.env -f deploy/aws/compose.yml up -d --build
-# Una instancia por host Linux; repetir con node2.env y node3.env en las otras EC2.
+# Un ControlNode y un DataNode por máquina virtual. Se ejecuta en cada VM desde
+# la raíz del repositorio, cada una con su archivo de configuración:
+#   docker compose --env-file deploy/aws/vm1.env -f deploy/aws/compose.yml up -d --build
+# Para una VM que solo agrega un DataNode, terminar el comando con "data".
+
 x-security: &security
   TLS_CERT: /secrets/cluster.crt
   TLS_KEY: /secrets/cluster.key
@@ -7,41 +10,35 @@ x-security: &security
   CLUSTER_KEY_FILE: /secrets/cluster-key
   SIGNING_KEY_FILE: /secrets/signing-key
   ENCRYPTION_KEY_FILE: /secrets/encryption-key
+
 services:
   control:
     image: dfsha-controlnode:aws
     build: {context: ../.., dockerfile: docker/controlnode.Dockerfile}
+    # Red del host: los nodos se hablan por la IP privada de cada VM.
     network_mode: host
     restart: unless-stopped
     environment:
       <<: *security
-      NODE_ID: ${CN_ID:?define CN_ID}
-      CN_ADDR: :8000
-      RAFT_ADDR: :9000
-      RAFT_ADVERTISE: ${PRIVATE_IP:?define PRIVATE_IP}:9000
-      CN_PEERS: ${CN_PEERS:?define CN_PEERS}
+      NODE_ID: ${CN_ID:?falta CN_ID}
+      CN_ADDR: ${PRIVATE_IP:?falta PRIVATE_IP}:8000
+      RAFT_ADDR: ${PRIVATE_IP}:9000
+      RAFT_ADVERTISE: ${PRIVATE_IP}:9000
+      CN_PEERS: ${CN_PEERS:?falta CN_PEERS}
       USERS_FILE: /secrets/users.json
       METADATA_DIR: /metadata
       REPLICATION_FACTOR: ${REPLICATION_FACTOR:-2}
-      BLOCK_SIZE_MIN_MB: 8
-      BLOCK_SIZE_MAX_MB: 64
-      BLOCKS_PER_NODE: 4
-      HEARTBEAT_MS: 3000
-      HEARTBEAT_MISSES: 3
-      WRITE_LEASE_SECONDS: 60
-      MAINTENANCE_MS: 5000
-      GC_GRACE_SECONDS: 120
-      FULL_THRESHOLD_PERCENT: 90
-      REBALANCE_THRESHOLD_PERCENT: 10
+      REBALANCE_THRESHOLD_PERCENT: ${REBALANCE_THRESHOLD_PERCENT:-10}
     volumes:
-      - ../../.secrets:/secrets:ro
+      - ${SECRETS_DIR:-../../.secrets}:/secrets:ro
       - ${DATA_ROOT:-/var/lib/dfsha}/control:/metadata
     healthcheck:
-      test: [CMD, wget, -q, -O, /dev/null, --ca-certificate=/secrets/ca.crt, https://localhost:8000/health]
+      test: [CMD, wget, -q, -O, /dev/null, --ca-certificate=/secrets/ca.crt, "https://${PRIVATE_IP}:8000/health"]
       interval: 5s
       timeout: 3s
       retries: 10
       start_period: 10s
+
   data:
     image: dfsha-datanode:aws
     build: {context: ../.., dockerfile: docker/datanode.Dockerfile}
@@ -49,19 +46,17 @@ services:
     restart: unless-stopped
     environment:
       <<: *security
-      NODE_ID: ${DN_ID:?define DN_ID}
-      DN_ADDR: :8001
-      ADVERTISE_URL: https://${PRIVATE_IP:?define PRIVATE_IP}:8001
-      CONTROL_URLS: ${CONTROL_URLS:?define CONTROL_URLS}
+      NODE_ID: ${DN_ID:?falta DN_ID}
+      DN_ADDR: ${PRIVATE_IP}:8001
+      ADVERTISE_URL: https://${PRIVATE_IP}:8001
+      CONTROL_URLS: ${CONTROL_URLS:?falta CONTROL_URLS}
       STORAGE_DIR: /data
       CAPACITY_BYTES: ${CAPACITY_BYTES:-1073741824}
-      HEARTBEAT_MS: 3000
-      REPORT_MS: 30000
     volumes:
-      - ../../.secrets:/secrets:ro
+      - ${SECRETS_DIR:-../../.secrets}:/secrets:ro
       - ${DATA_ROOT:-/var/lib/dfsha}/blocks:/data
     healthcheck:
-      test: [CMD, wget, -q, -O, /dev/null, --ca-certificate=/secrets/ca.crt, https://localhost:8001/health]
+      test: [CMD, wget, -q, -O, /dev/null, --ca-certificate=/secrets/ca.crt, "https://${PRIVATE_IP}:8001/health"]
       interval: 5s
       timeout: 3s
       retries: 10
