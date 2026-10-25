@@ -132,6 +132,9 @@ services:
       context: .
       dockerfile: docker/client.Dockerfile
     profiles: [tools]
+    # Mismo usuario que el de la máquina (1000 en Ubuntu y en EC2), para que
+    # los archivos que descarga en /work no queden de root.
+    user: "${DFSHA_UID:-1000}:${DFSHA_GID:-1000}"
     working_dir: /work
     environment:
       DFSHA_CONTROLS: https://cn1:8000,https://cn2:8000,https://cn3:8000
