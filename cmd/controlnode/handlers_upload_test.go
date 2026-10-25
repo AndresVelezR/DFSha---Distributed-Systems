@@ -1,9 +1,13 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -120,5 +124,30 @@ func TestFSMRoundTrip(t *testing.T) {
 	}
 	if !other.state.Dirs[key("demo", "/persistent")] {
 		t.Fatal("lost metadata")
+	}
+}
+
+// Si un destino cayó durante la subida, el bloque se publica con las copias
+// que sí quedaron (Hito 1). Sin ninguna copia verificada no se publica.
+func TestCommitPublishesAvailableCopies(t *testing.T) {
+	content := []byte("bloque")
+	id := fmt.Sprintf("%x", sha256.Sum256(content))
+	dn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Block-SHA256", id)
+		w.Header().Set("Content-Length", strconv.Itoa(len(content)))
+	}))
+	defer dn.Close()
+	s := newTestServer(t, 2)
+	s.nodes["a"].URL = dn.URL
+	up := &UploadSession{UploadID: "up", Owner: "demo", Path: "/a", Size: int64(len(content)), SHA256: id, BlockSize: 8 * megabyte, NBlocks: 1, ExpiresAt: time.Now().Add(time.Minute), Blocks: []BlockPlan{{Index: 0, Targets: []Target{{Node: "a"}, {Node: "b"}}}}}
+	v := s.state()
+	v.Uploads[up.UploadID] = up
+	s.save(v)
+	body := `{"upload_id":"up","sha256":"` + id + `","blocks":[{"index":0,"block_id":"` + id + `","size":` + strconv.Itoa(len(content)) + `}]}`
+	if r := api(s, "POST", "/files/upload/commit", body, "demo"); r.Code != 200 {
+		t.Fatal(r.Code, r.Body)
+	}
+	if got := s.state().Files[key("demo", "/a")].Blocks[0].StoredOn; len(got) != 1 || got[0] != "a" {
+		t.Fatalf("stored_on=%v, se esperaba solo la copia verificada [a]", got)
 	}
 }

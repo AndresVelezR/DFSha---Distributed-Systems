@@ -272,6 +272,23 @@ class WriteAndUploadTest(ClientTestCase):
         self.assertEqual(json.loads(request.call_args.kwargs["headers"]["X-Forward-To"]), targets[1:])
         self.assertEqual(request.call_args.kwargs["headers"]["Authorization"], "Bearer read-capability")
 
+    def test_upload_uses_next_target_when_first_is_down(self):
+        source = self.local("upload.bin", b"abcd")
+        targets = self.plan()["blocks"][0]["targets"]
+        calls = []
+
+        def request(method, url, **kwargs):
+            calls.append(url)
+            if "dn1" in url:
+                raise ConnectionRefusedError()
+            return {"stored_on": ["dn2"]}
+        with mock.patch.object(self.client, "_request", side_effect=request), mock.patch("dfsha.time.sleep"), \
+                mock.patch("sys.stderr"):
+            result = self.client._upload_block(source, 4, {"index": 0, "targets": targets})
+        self.assertEqual(result["stored_on"], ["dn2"])
+        self.assertEqual(len(calls), 5)  # 4 intentos contra dn1 y 1 contra dn2
+        self.assertIn("dn2", calls[-1])
+
     def test_upload_does_not_invent_replica_confirmation(self):
         source = self.local("upload.bin", b"abcd")
         with mock.patch.object(self.client, "_request", return_value={}):

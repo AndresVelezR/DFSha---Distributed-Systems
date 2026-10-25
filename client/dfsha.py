@@ -25,7 +25,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 DEFAULT_CONTROL_URL = "https://localhost:8000"
 DEFAULT_WORKERS = 4
-BLOCK_TIMEOUT_SECONDS = 300
+# Los tiempos límite de urllib aplican a cada operación de red, no al total:
+# una transferencia lenta pero que avanza no se corta.
+BLOCK_TIMEOUT_SECONDS = 60
+CONTROL_TIMEOUT_SECONDS = 15
 MAX_BLOCK_SIZE = 64 * 1024 * 1024
 UPLOAD_RENEW_SECONDS = 20
 READ_REFRESH_SECONDS = 40
@@ -183,10 +186,12 @@ class DfshaClient:
         except urllib.error.HTTPError as error:
             raise DfshaHttpError(error.code, error.read().decode(errors="replace")) from error
 
-    def _control(self, method, endpoint, query=None, json_body=None, timeout=120):
+    def _control(self, method, endpoint, query=None, json_body=None, timeout=CONTROL_TIMEOUT_SECONDS):
         suffix = endpoint + ("?" + urllib.parse.urlencode(query) if query else "")
         last_error = None
-        for wait in (0, 1, 2):
+        # Durante una elección no hay líder por unos segundos: se espera
+        # 1, 2 y 4 s entre rondas antes de rendirse.
+        for wait in (0,) + RETRY_WAITS_SECONDS:
             if wait:
                 time.sleep(wait)
             candidates = list(dict.fromkeys([self.control_url] + self.controls))
@@ -367,23 +372,38 @@ class DfshaClient:
         return commit
 
     def _upload_block(self, local_path, block_size, block_plan):
+        """Envía el bloque al primer destino, que lo propaga a los demás.
+
+        Si un destino no responde después de los reintentos, el siguiente del
+        plan pasa a ser el primero. El ControlNode publica las copias que sí
+        quedaron y la reparación repone las demás.
+        """
         data = read_block(local_path, block_plan["index"], block_size)
         block_id = hashlib.sha256(data).hexdigest()
-        if not block_plan["targets"]:
+        targets = block_plan["targets"]
+        if not targets:
             raise RuntimeError("bloque sin destinos autorizados")
-        first, *others = block_plan["targets"]
-        headers = self._node_headers(first)
-        headers["Content-Type"] = "application/octet-stream"
-        if others:
-            headers["X-Forward-To"] = json.dumps(others, separators=(",", ":"))
-        response = with_network_retries(
-            lambda: self._request("PUT", self._block_url(first, block_id), data=data, headers=headers, timeout=BLOCK_TIMEOUT_SECONDS),
-            f"bloque {block_plan['index']} -> {first['node']}",
-        )
-        stored_on = response.get("stored_on")
-        if not isinstance(stored_on, list) or not stored_on:
-            raise RuntimeError("el DataNode no confirmó réplicas almacenadas")
-        return {"index": block_plan["index"], "block_id": block_id, "size": len(data), "stored_on": stored_on}
+        last_error = None
+        for position, first in enumerate(targets):
+            others = targets[position + 1:]
+            headers = self._node_headers(first)
+            headers["Content-Type"] = "application/octet-stream"
+            if others:
+                headers["X-Forward-To"] = json.dumps(others, separators=(",", ":"))
+            try:
+                response = with_network_retries(
+                    lambda: self._request("PUT", self._block_url(first, block_id), data=data, headers=headers, timeout=BLOCK_TIMEOUT_SECONDS),
+                    f"bloque {block_plan['index']} -> {first['node']}",
+                )
+            except NETWORK_ERRORS as error:
+                last_error = error
+                self._progress(f"  {first['node']} no responde; se usa el siguiente destino del plan")
+                continue
+            stored_on = response.get("stored_on")
+            if not isinstance(stored_on, list) or not stored_on:
+                raise RuntimeError("el DataNode no confirmó réplicas almacenadas")
+            return {"index": block_plan["index"], "block_id": block_id, "size": len(data), "stored_on": stored_on}
+        raise last_error
 
     def _download_plan(self, remote_path, handle=None):
         query = {"path": self.path(remote_path)}

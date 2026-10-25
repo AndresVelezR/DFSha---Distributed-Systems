@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net/http"
 	"path"
 	"sort"
@@ -212,9 +213,15 @@ func (s *Server) uploadCommit(w http.ResponseWriter, r *http.Request) {
 				verified = append(verified, t.Node)
 			}
 		}
-		if len(verified) != len(up.Blocks[i].Targets) {
-			fail(w, 409, "faltan réplicas verificadas del plan")
+		// Como define el Hito 1, si un destino cayó durante la subida se
+		// publican las copias que sí quedaron y la reparación repone las que
+		// faltan. Un bloque sin ninguna copia verificada impide publicar.
+		if len(verified) == 0 {
+			fail(w, 409, fmt.Sprintf("el bloque %d no está en ningún DataNode del plan", i))
 			return
+		}
+		if len(verified) < len(up.Blocks[i].Targets) {
+			log.Printf("bloque %d de %s publicado con %d de %d copias; la reparación completa las demás", i, up.Path, len(verified), len(up.Blocks[i].Targets))
 		}
 		b.StoredOn = verified
 	}
