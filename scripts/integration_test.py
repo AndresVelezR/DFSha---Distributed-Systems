@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Integration test against independent native Go processes, with real TLS.
+"""Prueba de integración: levanta 3 ControlNodes y 4 DataNodes como procesos
+reales con TLS en esta máquina, ejecuta los escenarios y simula fallos.
 
-Build bin/admin, bin/controlnode and bin/datanode first, then run this file.
-No Docker or third-party Python package is required. Generated credentials and
-persistent data are private and temporary; only sanitized metrics are exported.
+Primero compilar con scripts/build.py. No necesita Docker. Las claves y los
+datos se generan en una carpeta temporal que se borra al final; el resultado
+queda en results/integration.json sin secretos.
 """
 from __future__ import annotations
 
@@ -35,7 +36,7 @@ MIB = 1024 * 1024
 
 
 def free_ports(count):
-    # Retain the sockets together so no address is selected twice.
+    # Se mantienen abiertos juntos para no elegir dos veces el mismo puerto.
     sockets = []
     try:
         for _ in range(count):
@@ -113,7 +114,7 @@ class NativeCluster:
         for name in ("cluster-key", "signing-key", "encryption-key"):
             self.redactions.append((self.secret_dir / name).read_text().strip())
         env = os.environ.copy()
-        # Parent shell defaults and sessions must not leak into an isolated run.
+        # La prueba no hereda sesiones ni claves de la terminal que la ejecuta.
         for name in ("CLUSTER_KEY", "SIGNING_KEY", "ENCRYPTION_KEY", "DFSHA_TOKEN", "DFSHA_SESSION", "DFSHA_CONTROL", "DFSHA_CONTROLS"):
             env.pop(name, None)
         env.update({
@@ -173,7 +174,7 @@ class NativeCluster:
     def close(self):
         for node in list(self.processes):
             self.stop(node)
-        # A failed Popen can leave a log handle without a process entry.
+        # Un proceso que no arrancó puede dejar abierto su archivo de log.
         for handle in self.logs.values():
             handle.close()
         self.logs.clear()
@@ -246,7 +247,7 @@ def run_suite(cluster, result, extended=False):
     checks = result["checks"]
 
     def check(name, action):
-        print(f"[RUN] {name}", flush=True)
+        print(f"[....] {name}", flush=True)
         start = time.perf_counter()
         try:
             value = action()
@@ -258,7 +259,7 @@ def run_suite(cluster, result, extended=False):
         if value is not None:
             record["evidence"] = value
         checks.append(record)
-        print(f"[PASS] {name} ({record['seconds']:.3f}s)", flush=True)
+        print(f"[ OK ] {name} ({record['seconds']:.3f}s)", flush=True)
         return value
 
     def topology():
@@ -281,7 +282,7 @@ def run_suite(cluster, result, extended=False):
         expect_http(404, lambda: other.stat("/course"))
         client.cd("/")
         return {"users": 2, "isolated_roots": True, "operations": ["login", "ls", "cd", "mkdir", "rmdir", "stat"]}
-    check("authentication and filesystem isolation", auth_and_filesystem)
+    check("autenticación y árbol privado por usuario", auth_and_filesystem)
 
     def empty_file():
         local = cluster.workdir / "empty.bin"
@@ -299,7 +300,7 @@ def run_suite(cluster, result, extended=False):
         assert output.read_bytes() == b""
         client.rm("/course/empty.bin")
         return {"size": 0, "blocks": len(blocks), "sha256": hashlib.sha256(b"").hexdigest()}
-    check("empty file round trip", empty_file)
+    check("subida y bajada de un archivo vacío", empty_file)
 
     orphan = {}
 
@@ -313,7 +314,7 @@ def run_suite(cluster, result, extended=False):
         orphan.update(block_id=stored["block_id"], nodes=stored["stored_on"])
         assert len(cluster.replica_counts([orphan["block_id"]])[orphan["block_id"]]) >= 2
         return {"block_id": orphan["block_id"], "uploaded_replicas": len(stored["stored_on"]), "published": False}
-    check("aborted upload leaves only unpublished orphan blocks", orphan_upload)
+    check("una subida abortada no publica nada", orphan_upload)
 
     source = cluster.workdir / "source-24MiB.bin"
     source_hash = payload(source, 24 * MIB, 260024)
@@ -336,13 +337,13 @@ def run_suite(cluster, result, extended=False):
         client.get(remote, output, workers=4)
         assert file_sha256(output) == source_hash
         return {"size": source.stat().st_size, "sha256": source_hash, "block_count": len(blocks), "blocks_per_node": per_node, "replication_factor": 2}
-    check("multi-block upload, distribution, replication and SHA256", upload_distribution)
+    check("archivo en varios bloques, reparto, réplicas y SHA-256", upload_distribution)
 
     def known_hash_attack():
         block = client.stat(remote)["blocks"][0]
         source = block["stored_on"][0]
-        # Populate every possible target as a trusted test fixture. This makes
-        # existence-only HEAD verification insufficient to reject the attack.
+        # Se pone el bloque en todos los destinos posibles: así no basta con
+        # comprobar que existe, hay que comprobar quién lo subió.
         for node in cluster.live_data():
             if node != source:
                 cluster.http("POST", cluster.datas[source] + "/blocks/" + block["block_id"] + "/replicate",
@@ -353,7 +354,7 @@ def run_suite(cluster, result, extended=False):
         expect_http(404, lambda: other.stat("/forged.bin"))
         other._control("POST", "/files/upload/abort", json_body={"upload_id": plan["upload_id"]})
         return {"existing_hash_commit_status": 409, "other_account_file_visible": False}
-    check("known block hash cannot claim another account's data", known_hash_attack)
+    check("conocer el hash de un bloque ajeno no da acceso a él", known_hash_attack)
 
     def reader_writer():
         read_handle = client.open(remote, "r")["handle"]
@@ -380,7 +381,7 @@ def run_suite(cluster, result, extended=False):
         client.close(write_handle)
         client.close(read_handle)
         return {"range_offset": offset, "range_length": length, "single_writer": True, "reader_snapshot": True, "copy_on_write_sha256": file_sha256(expected)}
-    check("range read, open/close, writer lock and copy-on-write", reader_writer)
+    check("lectura por rango, open/close, lock y write con copia", reader_writer)
     expected = cluster.workdir / "expected.bin"
     expected_hash = file_sha256(expected)
 
@@ -405,7 +406,7 @@ def run_suite(cluster, result, extended=False):
             expect_http(401, lambda token=token: client._request("GET", client._block_url(target, block["block_id"]), headers={"Authorization": "Bearer " + token}))
         expect_http(404, lambda: other._download_plan(remote))
         return {"partial_blocks_uploaded": 1, "planned_blocks": plan["n_blocks"], "incomplete_never_published": True, "session_token_denied_at_datanode": True, "expired_capability_denied": True, "wrong_node_capability_denied": True, "other_user_denied": True}
-    check("atomic publication and direct block authorization", incomplete_upload)
+    check("publicación atómica y permisos de acceso a bloques", incomplete_upload)
 
     def benchmark():
         metrics = []
@@ -425,7 +426,7 @@ def run_suite(cluster, result, extended=False):
                 metrics.append({"bytes": size, "workers": workers, "upload_seconds": round(upload, 6), "download_seconds": round(download, 6), "upload_MiB_s": round(size / MIB / upload, 3), "download_MiB_s": round(size / MIB / download, 3), "sha256_verified": True})
         result["benchmarks"] = metrics
         return metrics
-    check("measured sequential and parallel transfers", benchmark)
+    check("medición de transferencias con 1 y 4 workers", benchmark)
 
     def corruption():
         block = client._download_plan(remote)["blocks"][0]
@@ -448,7 +449,7 @@ def run_suite(cluster, result, extended=False):
         counts = eventually(lambda: (counts if all(len(nodes) >= 2 for nodes in counts.values()) else None) if (counts := cluster.replica_counts([block_id])) else None,
                             description="automatic repair after corruption")
         return {"block_id": block_id, "corrupt_node": node, "fallback_node": used_node, "valid_replicas_after_repair": counts[block_id]}
-    check("encrypted-block corruption detection, fallback and repair", corruption)
+    check("bloque corrupto: detección, otra réplica y reparación", corruption)
 
     def data_failure():
         plan = client._download_plan(remote)
@@ -466,7 +467,7 @@ def run_suite(cluster, result, extended=False):
         cluster.start(failed)
         eventually(lambda: cluster.health(failed), description="restarted DataNode")
         return {"failed_node": failed, "fallback_node": used, "valid_replicas_during_outage": repaired, "restart": True}
-    check("DataNode outage during read, repair and restart", data_failure)
+    check("caída de un DataNode: lectura, reparación y regreso", data_failure)
 
     def leader_failure():
         client.stat(remote)
@@ -484,7 +485,7 @@ def run_suite(cluster, result, extended=False):
         cluster.start(failed)
         eventually(lambda: cluster.health(failed), description="recovered ControlNode")
         return {"failed_node": failed, "new_leader": next(node for node, url in cluster.controls.items() if url == new_url), "confirmed_metadata_preserved": True}
-    check("leader election, confirmed metadata and recovered ControlNode", leader_failure)
+    check("caída del líder: elección, metadatos conservados y regreso", leader_failure)
 
     def scale_out():
         cluster.start("dn-04")
@@ -493,7 +494,7 @@ def run_suite(cluster, result, extended=False):
         inventory = eventually(lambda: (value if value["blocks"] else None) if (value := cluster.inventory("dn-04")) else None,
                                timeout=180, description="automatic rebalancing to new DataNode")
         return {"node": "dn-04", "blocks_received": len(inventory["blocks"]), "used_bytes": inventory["used"], "capacity_bytes": inventory["capacity"]}
-    check("dynamic DataNode scale-out and rebalance", scale_out)
+    check("cuarto DataNode en caliente y rebalanceo", scale_out)
 
     def metadata_restart():
         data_nodes = cluster.live_data()
@@ -512,7 +513,7 @@ def run_suite(cluster, result, extended=False):
         eventually(lambda: client.get(remote, output), timeout=45, description="persistent blocks after complete cluster restart")
         assert file_sha256(output) == expected_hash
         return {"all_controlnodes_restarted": 3, "all_datanodes_restarted": len(data_nodes), "sha256_verified": True, "new_directory_preserved": True}
-    check("persistent metadata and blocks after complete cluster restart", metadata_restart)
+    check("reinicio completo del clúster sin perder datos", metadata_restart)
 
     def no_quorum():
         client.stat(remote)
@@ -528,8 +529,8 @@ def run_suite(cluster, result, extended=False):
                 assert error.status == 503, f"unexpected minority response: {error}"
                 return True
             except NETWORK_ERRORS:
-                # During leader step-down an in-flight connection can close;
-                # retry until an actual 503 is observed. A 2xx always fails.
+                # Mientras el líder deja de serlo una conexión se puede cerrar;
+                # se insiste hasta ver un 503. Un 2xx es siempre un fallo.
                 return False
             raise AssertionError("minority acknowledged a write without quorum")
         eventually(rejected, timeout=20, description="explicit HTTP 503 from minority")
@@ -538,7 +539,7 @@ def run_suite(cluster, result, extended=False):
         eventually(lambda: client.stat(remote), timeout=45, description="majority recovery")
         expect_http(404, lambda: client.stat("/must-not-commit"))
         return {"remaining_controlnodes": 1, "write_status": 503, "uncommitted_path_absent_after_recovery": True}
-    check("minority rejects writes and never publishes them", no_quorum)
+    check("sin mayoría no se acepta ninguna escritura", no_quorum)
 
     def rename_remove():
         client.mv(remote, "/course/moved.bin")
@@ -547,7 +548,7 @@ def run_suite(cluster, result, extended=False):
         client.rm("/course/moved.bin")
         expect_http(404, lambda: client.stat("/course/moved.bin"))
         return {"mv": True, "rm": True}
-    check("move and remove published file", rename_remove)
+    check("mover y borrar un archivo publicado", rename_remove)
 
     if extended:
         def renewal_and_expiry():
@@ -556,7 +557,7 @@ def run_suite(cluster, result, extended=False):
             original_upload, original_control = client._upload_block, client._control
             renewals = []
             def slow_upload(*args, **kwargs):
-                # The real client lease thread renews after its default 20s.
+                # El cliente real renueva la reserva cada 20 s.
                 time.sleep(21)
                 return original_upload(*args, **kwargs)
             def tracked_control(method, endpoint, *args, **kwargs):
@@ -580,11 +581,10 @@ def run_suite(cluster, result, extended=False):
             expect_http(410, lambda: client._control("POST", "/files/upload/commit", json_body={"upload_id": plan["upload_id"], "blocks": [], "sha256": digest}))
             expect_http(404, lambda: client.stat("/course/expired.bin"))
             target = plan["blocks"][0]["targets"][0]
-            # An empty probe observes the auth status without racing a large
-            # request body against the server's early HTTP rejection/close.
+            # Una petición vacía basta para ver el código de autorización.
             expect_http(401, lambda: client._request("PUT", client._block_url(target, digest), data=b"", headers=client._node_headers(target)))
             return {"client_renewals": len(renewals), "client_renew_interval_seconds": 20, "expired_reservation_status": 410, "expired_write_capability_status": 401, "file_published_after_expiry": False}
-        check("real client automatic renewal and reservation expiry", renewal_and_expiry)
+        check("renovación automática y vencimiento de la reserva", renewal_and_expiry)
 
         def reclamation():
             benchmark_path = f"/course/bench-{24 * MIB}-w4.bin"
@@ -605,16 +605,16 @@ def run_suite(cluster, result, extended=False):
             client.get(benchmark_path, output)
             assert file_sha256(output) == client.stat(benchmark_path)["sha256"]
             return {"orphan_block": orphan["block_id"], "orphan_copies_after_gc": 0, "valid_replica_counts": {block: len(nodes) for block, nodes in counts.items()}, "file_sha256_verified_after_gc": True, "gc_grace_seconds": 120}
-        check("real orphan garbage collection and safe replica retirement", reclamation)
+        check("borrado de huérfanos y de copias sobrantes", reclamation)
     result["storage"] = {node: {key: value for key, value in cluster.inventory(node).items() if key in ("node_id", "used", "capacity")} for node in cluster.live_data()}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin-dir", type=Path, default=ROOT / "bin")
-    parser.add_argument("--output", type=Path, default=ROOT / "docs" / "resultados" / "integration.json")
-    parser.add_argument("--keep-workdir", action="store_true", help="keep private generated data for debugging; never commit it")
-    parser.add_argument("--extended", action="store_true", help="also wait for real 20s renewal, 60s expiry and 120s GC grace/replica retirement")
+    parser.add_argument("--output", type=Path, default=ROOT / "results" / "integration.json")
+    parser.add_argument("--keep-workdir", action="store_true", help="conservar la carpeta temporal para depurar")
+    parser.add_argument("--extended", action="store_true", help="incluir los escenarios lentos: renovación (20 s), vencimiento (60 s) y borrado (120 s)")
     args = parser.parse_args()
     workdir = Path(tempfile.mkdtemp(prefix="dfsha-integration-"))
     cluster = NativeCluster(args.bin_dir.resolve(), workdir)
@@ -645,10 +645,11 @@ def main():
             else:
                 os.environ[key] = value
         if args.keep_workdir:
-            print(f"Private workdir retained: {workdir}", file=sys.stderr)
+            print(f"Carpeta temporal conservada: {workdir}", file=sys.stderr)
         else:
             shutil.rmtree(workdir)
-    print(f"Integration {result['status']}: {len(result['checks'])} checks; metrics: {args.output}", flush=True)
+    status = "aprobada" if result["status"] == "passed" else "fallida"
+    print(f"Integración {status}: {len(result['checks'])} escenarios; resultado en {args.output}", flush=True)
     return 0 if result["status"] == "passed" else 1
 
 

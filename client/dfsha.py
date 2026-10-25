@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""CLI/API DFSha: stdlib, descubrimiento, TLS y transferencias por bloques.
+"""Cliente de DFSha: línea de comandos y API en Python, sin dependencias.
 
-Cada worker retiene como máximo un bloque (64 MiB). Las descargas se publican
-localmente solo después de verificar el SHA-256 del archivo completo.
+El cliente le pide al ControlNode un plan (qué bloques y en qué DataNodes) y
+mueve los bloques directamente con los DataNodes, varios a la vez. Cada worker
+tiene en memoria como máximo un bloque (64 MiB). Una descarga solo reemplaza
+el archivo local después de verificar el SHA-256 del archivo completo.
 """
 import argparse
 import getpass
@@ -574,10 +576,6 @@ class DfshaClient:
             return self.put(temporary, record["path"], workers, handle=handle)
         finally:
             os.unlink(temporary)
-
-
-# Compatibilidad del nombre de clase usado en el Hito 2 inicial.
-DFSClient = DfshaClient
 
 
 def build_parser():

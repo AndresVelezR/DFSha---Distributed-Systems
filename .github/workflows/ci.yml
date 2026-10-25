@@ -32,7 +32,7 @@ jobs:
           go build -o bin/controlnode ./cmd/controlnode
           go build -o bin/datanode ./cmd/datanode
       - name: Integration, failures and metrics
-        run: python scripts/integration_test.py --output results/integration.json
+        run: python scripts/integration_test.py
       - name: Preserve actual results
         if: always()
         uses: actions/upload-artifact@v4
