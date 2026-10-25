@@ -32,7 +32,9 @@ func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // withClusterKey protege las rutas que usan los DataNodes: exigen la clave
-// compartida del clúster, que un cliente no conoce.
+// compartida del clúster, que un cliente no conoce. No exigen ser el líder:
+// registro y heartbeat solo actualizan la lista de DataNodes en memoria, y
+// así un seguidor que gana una elección ya sabe qué DataNodes están vivos.
 func (s *Server) withClusterKey(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !common.ClusterAuth(r, s.cfg.Security.ClusterKey) {
@@ -41,9 +43,6 @@ func (s *Server) withClusterKey(next http.HandlerFunc) http.HandlerFunc {
 		}
 		s.op.Lock()
 		defer s.op.Unlock()
-		if !s.leader(w) {
-			return
-		}
 		next(w, r)
 	}
 }
