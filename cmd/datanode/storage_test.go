@@ -366,3 +366,35 @@ func TestInventoryReverifiesChangedBlock(t *testing.T) {
 		t.Fatalf("el bloque alterado siguió en el inventario: %v %d", blocks, used)
 	}
 }
+
+// El líder pregunta la autoría y hace HEAD con un tiempo límite mientras el
+// DataNode puede estar ocupado escribiendo o haciendo inventario: ninguna de
+// las dos respuestas debe esperar al candado de almacenamiento.
+func TestOwnershipAndHeadDoNotWaitForStorageLock(t *testing.T) {
+	n := testNode(t, "dn-01")
+	content := []byte("bloque recién subido")
+	id := hashID(content)
+	if _, err := n.store(id, content); err != nil {
+		t.Fatal(err)
+	}
+	if err := n.recordOwner(id, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	n.storageMu.Lock()
+	defer n.storageMu.Unlock()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() {
+		headers := internal(n)
+		headers["X-Block-Owner"] = "alice"
+		done <- request(n, http.MethodHead, "/blocks/"+id, nil, "", headers)
+	}()
+	select {
+	case got := <-done:
+		requireCode(t, got, http.StatusOK)
+		if got.Header().Get("Content-Length") != strconv.Itoa(len(content)) || got.Header().Get("X-Block-SHA256") != id {
+			t.Fatalf("cabeceras: %v", got.Header())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HEAD esperó al candado de almacenamiento")
+	}
+}

@@ -90,6 +90,11 @@ func (n *Node) store(id string, plain []byte) (bool, error) {
 	if err := os.Rename(tmpName, p); err != nil {
 		return false, err
 	}
+	// El bloque se verificó contra su SHA-256 al recibirlo: queda marcado como
+	// verificado para que el inventario no lo vuelva a descifrar.
+	if info, err := os.Stat(p); err == nil {
+		n.remember(id, verifiedFile{diskSize: info.Size(), modTime: info.ModTime(), size: int64(len(plain))})
+	}
 	// fsync de directorio en Unix. Windows lo rechaza; el archivo ya se
 	// sincronizó antes de publicar en ambas plataformas.
 	if dir, err := os.Open(n.StorageDir); err == nil {
@@ -182,9 +187,6 @@ func (n *Node) inventoryLocked() ([]blockInfo, int64) {
 		log.Printf("leer inventario %s: %v", n.ID, err)
 		return blocks, used
 	}
-	if n.verified == nil {
-		n.verified = map[string]verifiedFile{}
-	}
 	present := map[string]bool{}
 	for _, e := range entries {
 		id := e.Name()
@@ -196,32 +198,63 @@ func (n *Node) inventoryLocked() ([]blockInfo, int64) {
 			continue
 		}
 		present[id] = true
-		cached, ok := n.verified[id]
-		if !ok || cached.diskSize != info.Size() || !cached.modTime.Equal(info.ModTime()) {
+		cached, ok := n.cached(id, info)
+		if !ok {
 			plain, err := n.readBlock(id)
 			if err != nil {
 				log.Printf("excluyendo bloque corrupto %s: %v", id, err)
-				delete(n.verified, id)
+				n.forgetVerified(id)
 				continue
 			}
 			cached = verifiedFile{diskSize: info.Size(), modTime: info.ModTime(), size: int64(len(plain))}
-			n.verified[id] = cached
+			n.remember(id, cached)
 		}
 		blocks = append(blocks, blockInfo{BlockID: id, Size: cached.size})
 		used += cached.size
 	}
+	n.cacheMu.Lock()
 	for id := range n.verified {
 		if !present[id] {
 			delete(n.verified, id)
 		}
 	}
+	n.cacheMu.Unlock()
 	return blocks, used
+}
+
+// cached devuelve la verificación guardada de un bloque si su archivo no
+// cambió de tamaño ni de fecha desde entonces.
+func (n *Node) cached(id string, info os.FileInfo) (verifiedFile, bool) {
+	n.cacheMu.Lock()
+	defer n.cacheMu.Unlock()
+	c, ok := n.verified[id]
+	return c, ok && c.diskSize == info.Size() && c.modTime.Equal(info.ModTime())
+}
+
+func (n *Node) remember(id string, v verifiedFile) {
+	n.cacheMu.Lock()
+	defer n.cacheMu.Unlock()
+	if n.verified == nil {
+		n.verified = map[string]verifiedFile{}
+	}
+	n.verified[id] = v
+}
+
+// verifiedSize responde, sin descifrar, si el bloque está verificado y no ha
+// cambiado en disco. Lo usa HEAD, que el líder consulta al confirmar subidas.
+func (n *Node) verifiedSize(id string) (int64, bool) {
+	info, err := os.Stat(filepath.Join(n.StorageDir, id))
+	if err != nil {
+		return 0, false
+	}
+	c, ok := n.cached(id, info)
+	return c.size, ok
 }
 
 // forgetVerified obliga a verificar de nuevo un bloque, por ejemplo después
 // de que una lectura lo encontró corrupto.
 func (n *Node) forgetVerified(id string) {
-	n.storageMu.Lock()
+	n.cacheMu.Lock()
 	delete(n.verified, id)
-	n.storageMu.Unlock()
+	n.cacheMu.Unlock()
 }

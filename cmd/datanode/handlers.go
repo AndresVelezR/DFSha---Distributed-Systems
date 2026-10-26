@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -150,6 +151,16 @@ func (n *Node) getBlock(w http.ResponseWriter, r *http.Request, id string) {
 		}
 		if !n.hasOwner(id, user) {
 			fail(w, 404, "esta cuenta no ha presentado el contenido del bloque")
+			return
+		}
+	}
+	// HEAD sobre un bloque ya verificado responde sin descifrar 64 MiB.
+	if r.Method == http.MethodHead {
+		if size, ok := n.verifiedSize(id); ok {
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("X-Block-SHA256", id)
+			w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 	}

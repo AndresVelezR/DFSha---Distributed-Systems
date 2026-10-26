@@ -26,7 +26,9 @@ type Node struct {
 	Client      *http.Client
 
 	storageMu sync.Mutex              // protege escrituras, borrados e inventario
+	cacheMu   sync.Mutex              // protege verified; nunca se toma durante un descifrado
 	verified  map[string]verifiedFile // bloques ya verificados, ver inventoryLocked
+	ownersMu  sync.Mutex              // protege el registro de autoría, ver ownership.go
 }
 
 type blockInfo struct {

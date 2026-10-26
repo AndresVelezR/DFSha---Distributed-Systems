@@ -12,8 +12,8 @@ func (n *Node) ownerPath(id, user string) string {
 	return filepath.Join(n.StorageDir, ".owners", id, hashID([]byte(user)))
 }
 func (n *Node) recordOwner(id, user string) error {
-	n.storageMu.Lock()
-	defer n.storageMu.Unlock()
+	n.ownersMu.Lock()
+	defer n.ownersMu.Unlock()
 	p := n.ownerPath(id, user)
 	if e := os.MkdirAll(filepath.Dir(p), 0700); e != nil {
 		return e
@@ -28,14 +28,19 @@ func (n *Node) recordOwner(id, user string) error {
 	}
 	return f.Close()
 }
+
+// hasOwner tiene su propio candado: no debe esperar a una escritura o a un
+// inventario en curso, porque el líder lo consulta con un tiempo límite.
 func (n *Node) hasOwner(id, user string) bool {
-	n.storageMu.Lock()
-	defer n.storageMu.Unlock()
+	n.ownersMu.Lock()
+	defer n.ownersMu.Unlock()
 	_, e := os.Stat(n.ownerPath(id, user))
 	return e == nil
 }
 
 func (n *Node) removeOwnersLocked(id string) {
+	n.ownersMu.Lock()
+	defer n.ownersMu.Unlock()
 	dir := filepath.Join(n.StorageDir, ".owners", id)
 	entries, e := os.ReadDir(dir)
 	if e != nil {
