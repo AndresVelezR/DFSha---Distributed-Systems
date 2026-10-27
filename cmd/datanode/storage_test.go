@@ -398,3 +398,25 @@ func TestOwnershipAndHeadDoNotWaitForStorageLock(t *testing.T) {
 		t.Fatal("HEAD esperó al candado de almacenamiento")
 	}
 }
+
+// El heartbeat calcula la ocupación con el inventario; no debe esperar a que
+// termine una escritura, o el líder daría por caído a un nodo ocupado.
+func TestHeartbeatInventoryDoesNotWaitForWrites(t *testing.T) {
+	n := testNode(t, "dn-01")
+	content := []byte("bloque")
+	if _, err := n.store(hashID(content), content); err != nil {
+		t.Fatal(err)
+	}
+	n.storageMu.Lock()
+	defer n.storageMu.Unlock()
+	done := make(chan int64, 1)
+	go func() { _, used := n.localInventory(); done <- used }()
+	select {
+	case used := <-done:
+		if used != int64(len(content)) {
+			t.Fatalf("used=%d", used)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("el inventario del heartbeat esperó al candado de escritura")
+	}
+}

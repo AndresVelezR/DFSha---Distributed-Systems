@@ -25,7 +25,8 @@ type Node struct {
 	Config      common.Config
 	Client      *http.Client
 
-	storageMu sync.Mutex              // protege escrituras, borrados e inventario
+	storageMu sync.Mutex              // protege la decisión de escribir, la publicación y los borrados
+	pending   int64                   // bytes reservados por escrituras en curso, bajo storageMu
 	cacheMu   sync.Mutex              // protege verified; nunca se toma durante un descifrado
 	verified  map[string]verifiedFile // bloques ya verificados, ver inventoryLocked
 	ownersMu  sync.Mutex              // protege el registro de autoría, ver ownership.go

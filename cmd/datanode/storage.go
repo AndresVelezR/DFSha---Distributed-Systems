@@ -35,15 +35,19 @@ func hashID(b []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// store guarda un bloque cifrado. El mutex protege la decisión de escribir y
-// el inventario; nunca se conserva durante transferencias de red. El bloque se
-// escribe a un temporal y se renombra al final, así que un bloque nunca queda
-// visible a medias y las lecturas no necesitan el mutex.
+// store guarda un bloque cifrado. El candado solo se toma para decidir y
+// reservar el espacio, y al final para publicar el archivo. Cifrar, escribir
+// y sincronizar 64 MiB a disco ocurre fuera de él, así que el heartbeat y
+// otras escrituras no esperan. El bloque se escribe a un temporal y se
+// renombra al final: nunca queda visible a medias y las lecturas no
+// necesitan el candado.
 func (n *Node) store(id string, plain []byte) (bool, error) {
-	n.storageMu.Lock()
-	defer n.storageMu.Unlock()
 	p := filepath.Join(n.StorageDir, id)
+	size := int64(len(plain))
+
+	n.storageMu.Lock()
 	if existing, err := n.readBlock(id); err == nil {
+		n.storageMu.Unlock()
 		if !bytes.Equal(existing, plain) {
 			return false, errors.New("conflicto con bloque inmutable")
 		}
@@ -52,9 +56,18 @@ func (n *Node) store(id string, plain []byte) (bool, error) {
 		log.Printf("reparando copia corrupta %s: %v", id, err)
 	}
 	_, used := n.inventoryLocked()
-	if int64(len(plain)) > n.Capacity-used {
+	if size > n.Capacity-used-n.pending {
+		n.storageMu.Unlock()
 		return false, errCapacity
 	}
+	n.pending += size
+	n.storageMu.Unlock()
+	defer func() {
+		n.storageMu.Lock()
+		n.pending -= size
+		n.storageMu.Unlock()
+	}()
+
 	sealed, err := n.encrypt(id, plain)
 	if err != nil {
 		return false, err
@@ -80,9 +93,15 @@ func (n *Node) store(id string, plain []byte) (bool, error) {
 	if closeErr != nil {
 		return false, closeErr
 	}
-	// Windows no permite renombrar sobre un archivo existente. Sólo puede
-	// existir una copia corrupta: la válida ya devolvió arriba bajo el mutex.
+
+	n.storageMu.Lock()
+	defer n.storageMu.Unlock()
 	if _, err := os.Stat(p); err == nil {
+		// Otra subida del mismo bloque terminó primero: si su copia es válida
+		// no hay nada que hacer. Si está corrupta, se reemplaza.
+		if _, err := n.readBlock(id); err == nil {
+			return false, nil
+		}
 		if err := os.Remove(p); err != nil {
 			return false, err
 		}
@@ -93,7 +112,7 @@ func (n *Node) store(id string, plain []byte) (bool, error) {
 	// El bloque se verificó contra su SHA-256 al recibirlo: queda marcado como
 	// verificado para que el inventario no lo vuelva a descifrar.
 	if info, err := os.Stat(p); err == nil {
-		n.remember(id, verifiedFile{diskSize: info.Size(), modTime: info.ModTime(), size: int64(len(plain))})
+		n.remember(id, verifiedFile{diskSize: info.Size(), modTime: info.ModTime(), size: size})
 	}
 	// fsync de directorio en Unix. Windows lo rechaza; el archivo ya se
 	// sincronizó antes de publicar en ambas plataformas.
@@ -160,9 +179,10 @@ func (n *Node) readBlock(id string) ([]byte, error) {
 	return plain, nil
 }
 
+// localInventory no toma el candado de almacenamiento: lo usa el heartbeat,
+// que no debe atrasarse mientras se guardan bloques. Leer el directorio es
+// seguro porque los bloques se publican con un rename atómico.
 func (n *Node) localInventory() ([]blockInfo, int64) {
-	n.storageMu.Lock()
-	defer n.storageMu.Unlock()
 	return n.inventoryLocked()
 }
 
